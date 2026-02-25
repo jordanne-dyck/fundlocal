@@ -105,18 +105,11 @@ const CATEGORIES = [
   { id: "research", label: "Scientific Research", icon: "🔬" },
 ];
 
-const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
-
 async function fetchClaude(body, signal, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
-    const res = await fetch("/api/anthropic/v1/messages", {
+    const res = await fetch("/api/anthropic", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal,
     });
