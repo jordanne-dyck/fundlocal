@@ -105,6 +105,54 @@ const CATEGORIES = [
   { id: "research", label: "Scientific Research", icon: "🔬" },
 ];
 
+const DEMO_PROPOSAL = {
+  proposal: {
+    title: "Parkdale Community Garden Expansion",
+    category: "environment",
+    location: "Toronto, ON",
+    goal: "$35,000",
+    problem: "Parkdale has the lowest green space per capita in Toronto. Our existing 20-plot community garden has a 45-person waitlist. Residents in surrounding towers have zero access to growing space.",
+    beneficiaries: "200+ Parkdale residents, including 45 families on the waitlist",
+    timeline: "8 months",
+    milestones: "Month 1-2: Site prep and permits\nMonth 3-4: Raised bed construction\nMonth 5: Irrigation install\nMonth 6-7: Accessibility mods\nMonth 8: Grand opening",
+    fundUse: "$15,000 raised beds and soil, $8,000 irrigation, $5,000 tool shed, $4,000 accessibility modifications, $3,000 contingency",
+    team: "Sarah Chen, Community Living Toronto (8 years community programming). Partnership with City of Toronto Parks Department.",
+    impactPlan: "Quarterly photo updates, annual plot holder survey, monthly financial reports posted publicly",
+    evidence: "",
+  },
+  aiResult: {
+    overall_assessment: "A well-structured community garden proposal from a verified registered charity. The 45-person waitlist demonstrates real demand. However, the claimed Parks Department partnership is unverified, and no evidence has been provided for site access.",
+    scores: {
+      impact: { rating: "High", explanation: "Lowest green space per capita claim is specific and verifiable; 200+ direct beneficiaries is meaningful." },
+      feasibility: { rating: "Medium", explanation: "Budget breakdown is reasonable but the 8-month timeline is tight for permits + construction + accessibility mods." },
+      readiness: { rating: "Medium", explanation: "Detailed milestones provided, but no evidence of permits applied for or site access secured." },
+      clarity: { rating: "High", explanation: "Problem, beneficiaries, budget, and impact plan are all clearly articulated." },
+    },
+    strengths: [
+      "Creator is a CRA-registered charity (Community Living Toronto, BN: 107694143RR0001) — verified via live database lookup",
+      "Specific, data-backed need: lowest green space per capita in Toronto with a 45-person waitlist",
+      "Detailed budget breakdown with reasonable line items totalling $35,000",
+      "Clear accountability plan with quarterly photos, surveys, and public financial reports",
+    ],
+    improvements: [
+      "Provide evidence of Parks Department partnership — a letter of support or MOU",
+      "Include proof of site access or lease agreement for the expansion area",
+      "Add contingency plan if permits are delayed beyond Month 2",
+      "Specify Sarah Chen's specific role and past project outcomes at Community Living Toronto",
+    ],
+    risk_flags: [
+      "UNVERIFIED: Partnership with City of Toronto Parks Department — no supporting documentation provided",
+      "UNVERIFIED: Sarah Chen's 8-year tenure at Community Living Toronto — no references or links",
+      "UNVERIFIED: Claim of lowest green space per capita — no source cited",
+    ],
+    suggested_milestones: [
+      "Month 1: Secure site access agreement and submit permit applications",
+      "Month 3: Complete raised bed construction — verified by site photos and receipts",
+      "Month 6: Accessibility modifications complete — verified by accessibility audit",
+    ],
+  },
+};
+
 async function fetchClaude(body, signal, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch("/api/anthropic", {
@@ -143,6 +191,390 @@ async function fetchClaude(body, signal, retries = 3) {
     }
     return cleaned;
   }
+}
+
+// Raw API call that returns the full Anthropic response (for tool-use flows)
+async function fetchClaudeRaw(body, signal) {
+  const res = await fetch("/api/anthropic", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    console.error("fetchClaudeRaw error:", res.status, errBody);
+    throw new Error(`API error: ${res.status} — ${errBody.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// Real tool-use verification: Claude calls search_charity_registry, we fetch the CRA charity list via Canada Open Data, Claude interprets
+async function runRegistryVerification(orgName, signal, onToolCall, onToolResult, onInterpretation) {
+  const tools = [{
+    name: "search_charity_registry",
+    description: "Search the Canada Revenue Agency's registered charity database via Canada Open Data. Returns matching charity records as JSON including legal name, BN (registration number), address, city, and province.",
+    input_schema: {
+      type: "object",
+      properties: {
+        organization_name: { type: "string", description: "Name of the organization to search for" },
+        province: { type: "string", description: "Province code (e.g. ON)" },
+      },
+      required: ["organization_name"],
+    },
+  }];
+
+  // Step 1: Ask Claude to verify the org — it should call the tool
+  const response1 = await fetchClaudeRaw({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1024,
+    tools,
+    messages: [{
+      role: "user",
+      content: `You are a compliance verification agent. Verify whether "${orgName}" is a registered charity or nonprofit in Canada. Use the search_charity_registry tool to look it up. After getting results, provide a concise summary: was the organization found, what is its BN (registration number), its address, and its status.`,
+    }],
+  }, signal);
+
+  // Step 2: Extract the tool_use block
+  const toolUseBlock = response1.content?.find(c => c.type === "tool_use");
+  if (!toolUseBlock) {
+    const textContent = response1.content?.map(c => c.text || "").join("") || "";
+    onInterpretation && onInterpretation(textContent);
+    return { toolCall: null, registryData: null, interpretation: textContent, rawResponse: response1 };
+  }
+
+  // Notify: Claude made the tool call
+  onToolCall && onToolCall(toolUseBlock);
+
+  // Step 3: Fetch from Canada Open Data CKAN API (CRA registered charity list)
+  const searchName = toolUseBlock.input?.organization_name || orgName;
+  let registryData = "";
+  try {
+    const registryRes = await fetch(`/api/registry/data/api/3/action/datastore_search?resource_id=31a52caf-fa79-4ab3-bded-1ccc7b61c17f&q=${encodeURIComponent(searchName)}&limit=5`, { signal });
+    const json = await registryRes.json();
+    const records = json.result?.records || [];
+    const total = json.result?.total || 0;
+    if (records.length > 0) {
+      registryData = `CRA Registered Charity Database — search results for "${searchName}":\n\nTotal matches found: ${total}\n\n` +
+        records.map((r, i) => `${i + 1}. Legal Name: ${r["Legal Name"]}\n   BN: ${r.BN}\n   Address: ${r["Address Line 1"]}, ${r.City}, ${r.Province} ${r["Postal Code"]}\n   Designation: ${r.Designation === "C" ? "Charity" : r.Designation}`).join("\n\n") +
+        `\n\nSource: Canada Open Data Portal — 2023 List of Charities (resource_id: 31a52caf-fa79-4ab3-bded-1ccc7b61c17f)`;
+    } else {
+      registryData = `CRA Registered Charity Database — search results for "${searchName}":\n\nNo matching registered charity found. Total results: 0.\n\nSource: Canada Open Data Portal — 2023 List of Charities`;
+    }
+  } catch (e) {
+    registryData = `Registry fetch failed: ${e.message}. The CRA charity database at open.canada.ca contains all registered Canadian charities.`;
+  }
+
+  // Notify: we got real registry data
+  onToolResult && onToolResult(registryData);
+
+  // Step 4: Send tool result back to Claude for interpretation
+  const cleanedContent = response1.content.map(block => {
+    if (block.type === "tool_use") {
+      const { caller, ...rest } = block;
+      return rest;
+    }
+    return block;
+  });
+  const response2 = await fetchClaudeRaw({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 512,
+    messages: [
+      { role: "user", content: `Verify whether "${orgName}" is a registered charity or nonprofit in Canada. Use the search_charity_registry tool.` },
+      { role: "assistant", content: cleanedContent },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: registryData,
+        }],
+      },
+    ],
+    tools,
+  }, signal);
+
+  const interpretation = response2.content?.map(c => c.text || "").join("") || "";
+  onInterpretation && onInterpretation(interpretation);
+
+  return {
+    toolCall: toolUseBlock,
+    registryData: registryData.slice(0, 2000),
+    interpretation,
+    rawResponse: { step1: response1, step2: response2 },
+  };
+}
+
+// Extract EXIF metadata from a JPEG file — camera, GPS coords, timestamp, AI detection
+function extractImageMetadata(arrayBuffer, fileName) {
+  const result = { hasExif: false, camera: null, software: null, gps: false, gpsCoords: null, timestamp: null, warnings: [] };
+
+  // Check filename for known AI generator patterns
+  const aiPatterns = [/gemini.generated/i, /dall.?e/i, /midjourney/i, /stable.?diffusion/i, /firefly/i, /ideogram/i, /leonardo/i, /playground/i, /bing.?image/i, /ai.?generated/i, /generated.?image/i];
+  for (const pat of aiPatterns) {
+    if (pat.test(fileName)) {
+      result.warnings.push(`Filename "${fileName}" matches known AI generator naming pattern: ${pat.source}`);
+    }
+  }
+
+  // Parse JPEG EXIF
+  const view = new DataView(arrayBuffer);
+  if (view.byteLength < 4) return result;
+  if (view.getUint16(0) !== 0xFFD8) return result; // Not JPEG
+
+  let offset = 2;
+  while (offset < view.byteLength - 2) {
+    const marker = view.getUint16(offset);
+    if (marker === 0xFFE1) { // APP1 = EXIF
+      result.hasExif = true;
+      const segLen = view.getUint16(offset + 2);
+      const segEnd = Math.min(offset + 4 + segLen - 2, view.byteLength);
+      const segment = new Uint8Array(arrayBuffer, offset + 4, segEnd - (offset + 4));
+      const text = Array.from(segment).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : " ").join("");
+
+      // Camera make
+      const makePatterns = [/Canon/i, /Nikon/i, /Sony/i, /Apple/i, /Samsung/i, /Google/i, /Huawei/i, /OnePlus/i, /Xiaomi/i, /FUJIFILM/i, /Olympus/i, /Panasonic/i, /LG/i, /Motorola/i, /DJI/i, /GoPro/i];
+      for (const mp of makePatterns) {
+        const match = text.match(mp);
+        if (match) { result.camera = match[0]; break; }
+      }
+
+      // Editing software
+      const swPatterns = [/Adobe\s*Photoshop/i, /GIMP/i, /Lightroom/i, /Snapseed/i];
+      for (const sp of swPatterns) {
+        const match = text.match(sp);
+        if (match) { result.software = match[0]; break; }
+      }
+
+      // Timestamp — look for EXIF date pattern: "YYYY:MM:DD HH:MM:SS"
+      const dateMatch = text.match(/(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+      if (dateMatch) {
+        result.timestamp = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}T${dateMatch[4]}:${dateMatch[5]}:${dateMatch[6]}`;
+      }
+
+      // GPS — check for GPS IFD presence
+      if (text.includes("GPS")) {
+        result.gps = true;
+        // Try to find GPS coordinates encoded in the EXIF segment
+        // GPS data is stored as rational numbers in IFD entries — we do a best-effort parse
+        // by looking for the TIFF byte order and scanning for GPS IFD tags
+        try {
+          const exifStart = offset + 4;
+          // Check for "Exif\0\0" header then TIFF header
+          if (segment[0] === 0x45 && segment[1] === 0x78) { // "Ex"
+            const tiffOffset = 6; // After "Exif\0\0"
+            const littleEndian = segment[tiffOffset] === 0x49; // "II" = little-endian
+            const tiffView = new DataView(arrayBuffer, exifStart + tiffOffset);
+
+            // Helper to read EXIF rational (two uint32s = numerator/denominator)
+            const getRational = (off) => {
+              const num = tiffView.getUint32(off, littleEndian);
+              const den = tiffView.getUint32(off + 4, littleEndian);
+              return den === 0 ? 0 : num / den;
+            };
+
+            // Scan for GPS IFD pointer in IFD0
+            const ifd0Offset = tiffView.getUint32(4, littleEndian);
+            const ifd0Count = tiffView.getUint16(ifd0Offset, littleEndian);
+            let gpsIfdOffset = null;
+            for (let i = 0; i < ifd0Count && i < 40; i++) {
+              const entryOffset = ifd0Offset + 2 + i * 12;
+              if (entryOffset + 12 > tiffView.byteLength) break;
+              const tag = tiffView.getUint16(entryOffset, littleEndian);
+              if (tag === 0x8825) { // GPSInfo IFD pointer
+                gpsIfdOffset = tiffView.getUint32(entryOffset + 8, littleEndian);
+                break;
+              }
+            }
+
+            if (gpsIfdOffset !== null && gpsIfdOffset < tiffView.byteLength - 4) {
+              const gpsCount = tiffView.getUint16(gpsIfdOffset, littleEndian);
+              let latRef = "N", lonRef = "W", latVals = null, lonVals = null;
+              for (let i = 0; i < gpsCount && i < 20; i++) {
+                const entryOffset = gpsIfdOffset + 2 + i * 12;
+                if (entryOffset + 12 > tiffView.byteLength) break;
+                const tag = tiffView.getUint16(entryOffset, littleEndian);
+                const valOffset = tiffView.getUint32(entryOffset + 8, littleEndian);
+                if (tag === 1) { // GPSLatitudeRef
+                  const ref = String.fromCharCode(tiffView.getUint8(entryOffset + 8));
+                  if (ref === "S" || ref === "N") latRef = ref;
+                }
+                if (tag === 3) { // GPSLongitudeRef
+                  const ref = String.fromCharCode(tiffView.getUint8(entryOffset + 8));
+                  if (ref === "E" || ref === "W") lonRef = ref;
+                }
+                if (tag === 2 && valOffset + 24 <= tiffView.byteLength) { // GPSLatitude
+                  latVals = [getRational(valOffset), getRational(valOffset + 8), getRational(valOffset + 16)];
+                }
+                if (tag === 4 && valOffset + 24 <= tiffView.byteLength) { // GPSLongitude
+                  lonVals = [getRational(valOffset), getRational(valOffset + 8), getRational(valOffset + 16)];
+                }
+              }
+              if (latVals && lonVals) {
+                let lat = latVals[0] + latVals[1] / 60 + latVals[2] / 3600;
+                let lon = lonVals[0] + lonVals[1] / 60 + lonVals[2] / 3600;
+                if (latRef === "S") lat = -lat;
+                if (lonRef === "W") lon = -lon;
+                if (Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+                  result.gpsCoords = { lat, lon };
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // GPS parsing failed — non-critical, gps flag is still set
+        }
+      }
+
+      break;
+    }
+    if ((marker & 0xFF00) !== 0xFF00) break;
+    const len = view.getUint16(offset + 2);
+    offset += 2 + len;
+  }
+
+  if (!result.hasExif) {
+    result.warnings.push("No EXIF metadata found — real camera/phone photos almost always contain EXIF data (camera model, timestamp, GPS). AI-generated images typically have no EXIF.");
+  }
+
+  return result;
+}
+
+// Haversine distance in km between two lat/lon points
+function gpsDistanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Validate photo timestamp against milestone date window
+function validateTimestamp(exifTimestamp, milestoneDate) {
+  if (!exifTimestamp) return { status: "unable_to_verify", detail: "No timestamp in EXIF — cannot verify when photo was taken" };
+  const photoDate = new Date(exifTimestamp);
+  if (isNaN(photoDate.getTime())) return { status: "unable_to_verify", detail: `Invalid EXIF timestamp: ${exifTimestamp}` };
+
+  const msDate = new Date(milestoneDate + "-01");
+  // Allow a window: 2 months before milestone start through 3 months after
+  const windowStart = new Date(msDate);
+  windowStart.setMonth(windowStart.getMonth() - 2);
+  const windowEnd = new Date(msDate);
+  windowEnd.setMonth(windowEnd.getMonth() + 3);
+
+  const fmt = d => d.toISOString().slice(0, 10);
+  if (photoDate < windowStart) {
+    return { status: "discrepancy", detail: `Photo taken ${fmt(photoDate)} — before milestone window (${fmt(windowStart)} to ${fmt(windowEnd)}). Photo may be reused from a different project.` };
+  }
+  if (photoDate > windowEnd) {
+    return { status: "discrepancy", detail: `Photo taken ${fmt(photoDate)} — after milestone window (${fmt(windowStart)} to ${fmt(windowEnd)}).` };
+  }
+  return { status: "verified", detail: `Photo taken ${fmt(photoDate)} — within milestone window (${fmt(windowStart)} to ${fmt(windowEnd)})` };
+}
+
+// Validate GPS coordinates against expected project location
+function validateGpsLocation(gpsCoords, expectedLocation) {
+  if (!gpsCoords) return { status: "unable_to_verify", detail: "No GPS coordinates in EXIF — cannot verify photo location" };
+
+  // Known project locations (Toronto-area)
+  const locations = {
+    "Toronto, ON": { lat: 43.6532, lon: -79.3832, radiusKm: 30, label: "Toronto" },
+    "Georgina, ON": { lat: 44.3000, lon: -79.4300, radiusKm: 20, label: "Georgina" },
+  };
+
+  const expected = locations[expectedLocation];
+  if (!expected) return { status: "unable_to_verify", detail: `Unknown project location: ${expectedLocation}` };
+
+  const dist = gpsDistanceKm(gpsCoords.lat, gpsCoords.lon, expected.lat, expected.lon);
+  const coordStr = `${gpsCoords.lat.toFixed(4)}°, ${gpsCoords.lon.toFixed(4)}°`;
+
+  if (dist <= expected.radiusKm) {
+    return { status: "verified", detail: `GPS coordinates (${coordStr}) are ${dist.toFixed(1)} km from ${expected.label} — within expected ${expected.radiusKm} km radius` };
+  }
+  return { status: "discrepancy", detail: `GPS coordinates (${coordStr}) are ${dist.toFixed(0)} km from ${expected.label} — outside expected ${expected.radiusKm} km radius. Photo may not be from the project site.` };
+}
+
+async function runPhotoVerification(imageFile, milestoneContext) {
+  // Read image as both base64 and ArrayBuffer
+  const [base64, arrayBuffer] = await Promise.all([
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(imageFile);
+    }),
+    imageFile.arrayBuffer(),
+  ]);
+
+  const mediaType = imageFile.type || "image/jpeg";
+
+  // Extract metadata for forensic analysis
+  const metadata = extractImageMetadata(arrayBuffer, imageFile.name);
+
+  // Build metadata context string for the prompt
+  let metadataContext = "FILE METADATA ANALYSIS (non-visual forensic signals):\n";
+  metadataContext += `- Filename: "${imageFile.name}"\n`;
+  metadataContext += `- EXIF data present: ${metadata.hasExif ? "YES" : "NO"}\n`;
+  if (metadata.camera) metadataContext += `- Camera detected in EXIF: ${metadata.camera}\n`;
+  if (metadata.software) metadataContext += `- Editing software in EXIF: ${metadata.software}\n`;
+  metadataContext += `- GPS coordinates in EXIF: ${metadata.gps ? "YES" : "NO"}\n`;
+  if (metadata.warnings.length > 0) {
+    metadataContext += `- WARNINGS:\n${metadata.warnings.map(w => `  ⚠ ${w}`).join("\n")}\n`;
+  }
+
+  const response = await fetchClaudeRaw({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1024,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+        { type: "text", text: `You are a compliance verification agent reviewing milestone evidence photos for a community investment platform. Be rigorous — investors' money depends on your assessment.
+
+Project: "${milestoneContext.projectTitle}"
+Creator: "${milestoneContext.creator}"
+Milestone: "${milestoneContext.milestoneName}"
+Expected evidence: "${milestoneContext.evidenceDescription}"
+Project location: "${milestoneContext.location}" (expect urban setting consistent with this)
+Project context: "${milestoneContext.projectDescription}"
+
+${metadataContext}
+
+Analyze this photo across four dimensions and respond in JSON only:
+{
+  "authenticity": { "status": "verified|unable_to_verify|discrepancy", "reasoning": "..." },
+  "subject_match": { "status": "verified|unable_to_verify|discrepancy", "reasoning": "..." },
+  "location_consistency": { "status": "verified|unable_to_verify|discrepancy", "reasoning": "..." },
+  "scale_plausibility": { "status": "verified|unable_to_verify|discrepancy", "reasoning": "..." },
+  "overall_verdict": "verified|unable_to_verify|discrepancy",
+  "summary": "one-line overall assessment"
+}
+
+IMPORTANT — each dimension is INDEPENDENT. Judge each one ONLY on its own criteria:
+
+1. authenticity: Determine ONLY if this is a real, unmanipulated photograph taken by a camera/phone, or if it is AI-generated, photoshopped, or otherwise manipulated. This dimension is SOLELY about whether the image is a genuine photo — NOT whether it matches the project or milestone. A real photo of the wrong subject is still authentic. Use BOTH visual analysis AND the file metadata above. Key signals:
+   - If the filename matches a known AI generator pattern (DALL-E, Midjourney, Gemini, Stable Diffusion, etc.), this is strong evidence of AI generation — mark "discrepancy".
+   - If NO EXIF metadata is present, this is a significant red flag — real photos from cameras and phones almost always have EXIF data (camera model, GPS, timestamps). AI-generated images almost never do. Missing EXIF alone should result in "unable_to_verify" at minimum.
+   - If EXIF IS present with a recognized camera make, this strongly supports authenticity — mark "verified" unless there are clear visual AI artifacts.
+   - Also check visually for AI artifacts: unnatural textures, warped text/numbers, impossible geometry, inconsistent lighting/shadows, extra fingers, uncanny smoothness.
+   - A photo that looks visually plausible but has NO EXIF and/or an AI-generator filename should be flagged — do NOT mark as "verified".
+   - Do NOT factor subject relevance into this score. That belongs in subject_match.
+2. subject_match: Does this photo show what the milestone claims? For "Panel installation" expect solar panels being installed or installed on a roof.
+3. location_consistency: Is the setting consistent with the project location? A school rooftop in Toronto should show an urban environment, flat commercial-style roof, not a desert, rural farmland, or residential suburb.
+4. scale_plausibility: Does the visible scope seem plausible for the project budget and description?` },
+      ],
+    }],
+  });
+
+  const raw = response.content?.map(c => c.text || "").join("") || "";
+  const cleaned = raw.replace(/```json|```/g, "").trim();
+  // Extract JSON object
+  const startIdx = cleaned.indexOf("{");
+  const endIdx = cleaned.lastIndexOf("}");
+  if (startIdx !== -1 && endIdx !== -1) {
+    return JSON.parse(cleaned.slice(startIdx, endIdx + 1));
+  }
+  return JSON.parse(cleaned);
 }
 
 async function getAIMatches(profile, projects, signal) {
@@ -225,7 +657,7 @@ function ScoreBreakdown({ scores }) {
   );
 }
 
-function Nav({ currentView, setCurrentView, setScreen }) {
+function Nav({ currentView, setCurrentView, setScreen, onComplianceDemo }) {
   const [signupToast, setSignupToast] = useState(false);
   const handleSignup = () => { setSignupToast(true); setTimeout(() => setSignupToast(false), 2500); };
   return (
@@ -239,6 +671,10 @@ function Nav({ currentView, setCurrentView, setScreen }) {
               {v.label}
             </button>
           ))}
+          <button onClick={onComplianceDemo}
+            style={{ padding: "8px 20px", borderRadius: 100, border: "none", cursor: "pointer", fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 500, background: currentView === "compliance" ? COLORS.dune : "transparent", color: currentView === "compliance" ? "#fff" : COLORS.textSecondary, transition: "all 0.2s" }}>
+            Compliance
+          </button>
         </div>
       </div>
       <div style={{ position: "relative" }}>
@@ -726,7 +1162,7 @@ function Dashboard({ investments }) {
   );
 }
 
-function CreatorView() {
+function CreatorView({ onSubmit }) {
   const [step, setStep] = useState("form");
   const [formStep, setFormStep] = useState(1);
   const [v, setV] = useState(false);
@@ -914,10 +1350,10 @@ Evaluate this proposal.`;
       <div style={{ display: "flex", gap: 12 }}>
         {isWeak ? (<>
           <button onClick={() => { setStep("form"); setFormStep(5); setAiResult(null); }} style={{ flex: 1, padding: "14px", borderRadius: 100, border: "none", background: COLORS.dune, color: "#fff", fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Revise proposal</button>
-          <button style={{ flex: 1, padding: "14px", borderRadius: 100, border: `1.5px solid ${COLORS.border}`, background: "#fff", color: COLORS.textSecondary, fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Submit anyway</button>
+          <button onClick={() => onSubmit && onSubmit({ title, category: cat, location: loc, goal, problem, beneficiaries, timeline, milestones, fundUse, team, impactPlan, evidence }, aiResult)} style={{ flex: 1, padding: "14px", borderRadius: 100, border: `1.5px solid ${COLORS.border}`, background: "#fff", color: COLORS.textSecondary, fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Submit anyway</button>
         </>) : (<>
           <button onClick={() => { setStep("form"); setFormStep(5); setAiResult(null); }} style={{ flex: 1, padding: "14px", borderRadius: 100, border: `1.5px solid ${COLORS.border}`, background: "#fff", color: COLORS.dune, fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Revise proposal</button>
-          <button style={{ flex: 1, padding: "14px", borderRadius: 100, border: "none", background: COLORS.dune, color: "#fff", fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Submit for review →</button>
+          <button onClick={() => onSubmit && onSubmit({ title, category: cat, location: loc, goal, problem, beneficiaries, timeline, milestones, fundUse, team, impactPlan, evidence }, aiResult)} style={{ flex: 1, padding: "14px", borderRadius: 100, border: "none", background: COLORS.dune, color: "#fff", fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Submit for review →</button>
         </>)}
       </div>
     </div>
@@ -961,7 +1397,7 @@ Evaluate this proposal.`;
       {formStep === 1 && <>
         <div style={fieldWrap}>
           <label style={labelStyle}>Project name</label>
-          <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Parkdale Community Garden Expansion" style={inputStyle} onFocus={focusHandler} onBlur={blurHandler} />
+          <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Community Garden Expansion" style={inputStyle} onFocus={focusHandler} onBlur={blurHandler} />
         </div>
         <div style={fieldWrap}>
           <label style={labelStyle}>Category</label>
@@ -1086,14 +1522,1213 @@ Evaluate this proposal.`;
   );
 }
 
+function buildAgentTrace(verificationResults) {
+  const traceMap = {
+    "Organization exists": { fn: "search_charity_registry", args: (r) => `"${r.detail?.match(/^(.*?)—/)?.[1]?.trim() || 'Community Living Toronto'}", province: "ON"`, source: "https://open.canada.ca/data/en/dataset/05b3abd0-e70f-4b3b-a9c5-acc436bd15b6", sourceLabel: "CRA Charity Database (Open Data)" },
+    "Partnership claim": { fn: "check_municipal_directory", args: (r) => `"City of Toronto Parks Department", partner: "Community Living Toronto"`, source: "https://www.toronto.ca/city-government/accountability-operations-customer-service/city-administration/city-managers-office/agencies-corporations/", sourceLabel: "City of Toronto Partner Directory" },
+    "Budget reasonableness": { fn: "analyze_budget_benchmarks", args: (r) => { const amt = r.detail?.match(/\$[\d,]+/)?.[0] || "$35,000"; return `type: "community_garden", amount: "${amt}", region: "Toronto"`; }, source: "https://communitygarden.org/resources/", sourceLabel: "ACGA Benchmark Data" },
+    "Creator credentials": { fn: "verify_creator_identity", args: (r) => `name: "${r.detail?.match(/^(.*?)found/)?.[1]?.trim() || 'creator'}", org: "submitted organization"`, source: "https://www.linkedin.com/search/results/people/", sourceLabel: "LinkedIn People Search" },
+    "Wealthsimple Business account": { fn: "verify_wealthsimple_business", args: (r) => `org: "${r.detail?.match(/for (.*?)$/i)?.[1]?.trim() || 'organization'}"`, sourceLabel: "Wealthsimple Business API" },
+  };
+  return verificationResults.map(r => {
+    const mapped = traceMap[r.check];
+    const fn = mapped?.fn || `verify_${r.check.toLowerCase().replace(/\s+/g, "_")}`;
+    const args = mapped?.args ? mapped.args(r) : `"${r.check}"`;
+    return { fn, args, result: r.detail || r.action, status: r.status, source: mapped?.source || null, sourceLabel: mapped?.sourceLabel || null };
+  });
+}
+
+const MILESTONE_AGENT_TRACE = [
+  { fn: "analyze_images", args: 'count: 12, type: "installation_progress"', result: "Solar panels visible on flat commercial roof, consistent with Riverdale Collegiate location", status: "verified", sourceLabel: "Claude Vision API" },
+  { fn: "compare_invoice", args: 'invoice: "$47,200", budget_allocation: "$62,500", phase: "Panel installation"', result: "75% of allocation — consistent with phased installation", status: "verified", sourceLabel: "Internal budget ledger" },
+  { fn: "verify_municipal_permit", args: 'number: "2025-ET-4421", municipality: "City of Toronto"', result: "Active electrical permit found in municipal database", status: "verified", source: "https://www.toronto.ca/city-government/planning-development/building-permits-renovation/", sourceLabel: "Toronto Building Permits" },
+];
+
+function AgentTracePanel({ trace, elapsed, collapsed: initialCollapsed = true, streaming = false, totalExpected = 0 }) {
+  const [collapsed, setCollapsed] = useState(initialCollapsed);
+  const bottomRef = useRef(null);
+  const statusColor = s => s === "verified" ? COLORS.green : s === "discrepancy" || s === "error" ? COLORS.red : "#B8860B";
+
+  useEffect(() => {
+    if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [trace.length]);
+
+  // When streaming, "done" means all expected entries have results filled in
+  const allHaveResults = trace.length > 0 && trace.every(t => t.result !== null);
+  const done = streaming ? (totalExpected > 0 ? trace.length >= totalExpected && allHaveResults : allHaveResults) : true;
+  const displayTrace = trace;
+
+  return (
+    <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 20 }}>
+      <div onClick={() => setCollapsed(!collapsed)} style={{ padding: "12px 16px", background: COLORS.warmWhite, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 700, color: COLORS.dune }}>Agent Activity</span>
+          {done ? (
+            <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>— {trace.length} actions completed{elapsed ? ` · ${elapsed}s` : ""} · claude-haiku-4-5</span>
+          ) : (
+            <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.accent, fontWeight: 600 }}>— running ({displayTrace.length}/{totalExpected || trace.length})... · claude-haiku-4-5</span>
+          )}
+        </div>
+        <span style={{ fontSize: 12, color: COLORS.textSecondary, transition: "transform 0.2s", transform: collapsed ? "rotate(0deg)" : "rotate(180deg)" }}>&#9660;</span>
+      </div>
+      {!collapsed && (
+        <div style={{ padding: "16px 20px", background: "#1a1a1a", fontFamily: "'DM Mono', 'Fira Code', monospace", fontSize: 13, lineHeight: 1.8, maxHeight: 320, overflowY: "auto" }}>
+          {displayTrace.map((t, i) => {
+            return (
+              <div key={i} style={{ marginBottom: i < displayTrace.length - 1 ? 16 : 0, opacity: 1, animation: streaming ? "traceIn 0.3s ease" : "none" }}>
+                <div>
+                  <span style={{ color: "#888" }}>→ </span>
+                  <span style={{ color: COLORS.accent }}>{t.fn}</span>
+                  <span style={{ color: "#ccc" }}>({t.args})</span>
+                </div>
+                <div style={{ paddingLeft: 18 }}>
+                  {t.result ? (
+                    <>
+                      <span style={{ color: "#888" }}>Result: </span>
+                      <span style={{ color: statusColor(t.status) }}>{t.result}</span>
+                      {t.sourceLabel && (
+                        <div style={{ marginTop: 2 }}>
+                          <span style={{ color: "#555" }}>Source: </span>
+                          {t.source ? (
+                            <a href={t.source} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ color: "#6b9eff", textDecoration: "none", borderBottom: "1px dotted #6b9eff" }}>{t.sourceLabel}</a>
+                          ) : (
+                            <span style={{ color: "#555" }}>{t.sourceLabel}</span>
+                          )}
+                        </div>
+                      )}
+                      {t.isReal && !t.failed && (
+                        <div style={{ marginTop: 2 }}>
+                          <span style={{ color: "#4ade80", fontSize: 11, fontWeight: 600 }}>LIVE — real tool_use API call</span>
+                        </div>
+                      )}
+                      {t.failed && (
+                        <div style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 10 }}>
+                          <span style={{ color: COLORS.red, fontSize: 11, fontWeight: 600 }}>FAILED — API call did not complete</span>
+                          {t.onRetry && (
+                            <button onClick={(e) => { e.stopPropagation(); t.onRetry(); }} style={{ padding: "2px 10px", borderRadius: 6, border: `1px solid ${COLORS.red}`, background: "transparent", color: COLORS.red, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Mono', 'Fira Code', monospace" }}>↻ Retry</button>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <span style={{ color: "#666", fontStyle: "italic", animation: "pulse 1s ease-in-out infinite" }}>awaiting response...</span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {!done && (
+            <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ color: COLORS.accent, animation: "pulse 1s ease-in-out infinite" }}>→</span>
+              <span style={{ color: "#888", fontStyle: "italic" }}>executing next action...</span>
+            </div>
+          )}
+          <div ref={bottomRef} />
+        </div>
+      )}
+      <style>{`@keyframes traceIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } } @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }`}</style>
+    </div>
+  );
+}
+
+async function runVerification(proposal, aiResult, signal) {
+  const system = `You are a compliance verification agent for FundLocal, a community investment platform. Your job is to verify claims made in a project proposal by describing what verification actions you would take and what the likely results would be.
+
+For each claim in the proposal, determine:
+1. What verification action would be taken (e.g., "Search public records", "Cross-reference CRA database")
+2. What the likely result would be
+3. Whether the claim can be verified, cannot be verified, or shows a discrepancy
+
+Be realistic and specific. For a community garden proposal, you might verify: organization existence, charity registration, partnership claims, budget reasonableness, creator credentials, Wealthsimple Business account linkage.
+
+OUTPUT FORMAT:
+Respond in EXACTLY this JSON (no markdown, no backticks):
+[{"check":"what is being checked","action":"what verification action was taken","status":"verified|unable_to_verify|discrepancy","detail":"specific finding","automated_action":"null or string describing automated follow-up"}]
+
+- Generate 4-6 checks
+- status must be exactly one of: "verified", "unable_to_verify", "discrepancy"
+- automated_action should be null for verified items, and a specific automated action string for items that need follow-up (e.g., "Auto-requested: CRA registration number requested from creator")
+- Be specific in details — cite organization names, registration databases, budget figures from the proposal`;
+
+  const userMessage = `PROPOSAL:
+Title: ${proposal.title || "Untitled"}
+Category: ${proposal.category || "N/A"}
+Location: ${proposal.location || "N/A"}
+Goal: ${proposal.goal || "N/A"}
+Problem: ${proposal.problem || "Not provided"}
+Beneficiaries: ${proposal.beneficiaries || "Not specified"}
+Fund use: ${proposal.fundUse || "Not provided"}
+Timeline: ${proposal.timeline || "Not provided"}
+Milestones: ${proposal.milestones || "Not provided"}
+Team: ${proposal.team || "Not provided"}
+Impact plan: ${proposal.impactPlan || "Not provided"}
+Evidence: ${proposal.evidence || "None"}
+
+AI PRE-SCREENING RESULT:
+${aiResult ? JSON.stringify(aiResult, null, 2) : "No pre-screening available"}
+
+Verify the claims in this proposal.`;
+
+  const cleaned = await fetchClaude({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 2048,
+    temperature: 0.3,
+    system,
+    messages: [{ role: "user", content: userMessage }],
+  }, signal);
+  return JSON.parse(cleaned);
+}
+
+function ComplianceDashboard({ submittedProposal }) {
+  const [activeTab, setActiveTab] = useState("proposals");
+  const [expandedProposal, setExpandedProposal] = useState(null);
+  const [expandedMilestone, setExpandedMilestone] = useState(null);
+  const [verificationResults, setVerificationResults] = useState(null);
+  const [verificationElapsed, setVerificationElapsed] = useState(null);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyStep, setVerifyStep] = useState(0);
+  const [liveTrace, setLiveTrace] = useState([]);
+  const [registryProof, setRegistryProof] = useState(null);
+  const [draftExpanded, setDraftExpanded] = useState({});
+  const [toast, setToast] = useState(null);
+  const [v, setV] = useState(false);
+  const [milestonePhoto, setMilestonePhoto] = useState(null);
+  const [milestonePhotoPreview, setMilestonePhotoPreview] = useState(null);
+  const [milestonePhotoResult, setMilestonePhotoResult] = useState(null);
+  const [milestonePhotoVerifying, setMilestonePhotoVerifying] = useState(false);
+  const [milestonePhotoTrace, setMilestonePhotoTrace] = useState([]);
+  const [milestonePhotoElapsed, setMilestonePhotoElapsed] = useState(null);
+  const [milestoneSecondary, setMilestoneSecondary] = useState(null);
+  useEffect(() => { setTimeout(() => setV(true), 100); }, []);
+
+  const showToast = msg => { setToast(msg); setTimeout(() => setToast(null), 2500); };
+
+  const handleMilestonePhoto = (file) => {
+    setMilestonePhoto(file);
+    setMilestonePhotoPreview(URL.createObjectURL(file));
+    setMilestonePhotoResult(null);
+    setMilestonePhotoTrace([]);
+    setMilestonePhotoElapsed(null);
+    setMilestoneSecondary(null);
+  };
+
+  const handlePhotoVerification = async () => {
+    if (!milestonePhoto) return;
+    setMilestonePhotoVerifying(true);
+    setMilestonePhotoResult(null);
+    const fileSizeKB = (milestonePhoto.size / 1024).toFixed(0);
+
+    // Run metadata extraction immediately for the first trace entry
+    const buf = await milestonePhoto.arrayBuffer();
+    const meta = extractImageMetadata(buf, milestonePhoto.name);
+    const metaStatus = meta.warnings.length > 0 ? "discrepancy" : meta.hasExif ? "verified" : "unable_to_verify";
+    const metaSummary = meta.warnings.length > 0
+      ? meta.warnings.join("; ")
+      : meta.hasExif
+        ? `EXIF present${meta.camera ? ` — camera: ${meta.camera}` : ""}${meta.gps ? ", GPS coordinates found" : ""}${meta.software ? `, edited with ${meta.software}` : ""}`
+        : "No EXIF metadata found — cannot confirm camera source";
+
+    // Run secondary verifications from metadata
+    const gpsResult = validateGpsLocation(meta.gpsCoords, "Toronto, ON");
+    const timestampResult = validateTimestamp(meta.timestamp, "2025-12"); // Panel installation milestone date
+
+    const gpsArgs = meta.gpsCoords
+      ? `lat: ${meta.gpsCoords.lat.toFixed(4)}, lon: ${meta.gpsCoords.lon.toFixed(4)}, expected: "Toronto, ON"`
+      : 'coords: null, expected: "Toronto, ON"';
+    const tsArgs = meta.timestamp
+      ? `timestamp: "${meta.timestamp}", milestone: "2025-12"`
+      : 'timestamp: null, milestone: "2025-12"';
+
+    setMilestonePhotoTrace([
+      { fn: "extract_file_metadata", args: `file: "${milestonePhoto.name}", size: "${fileSizeKB} KB"`, result: metaSummary, status: metaStatus, sourceLabel: "File metadata parser", isReal: true },
+      { fn: "verify_gps_location", args: gpsArgs, result: gpsResult.detail, status: gpsResult.status, sourceLabel: "EXIF GPS + Haversine", isReal: true },
+      { fn: "validate_photo_timestamp", args: tsArgs, result: timestampResult.detail, status: timestampResult.status, sourceLabel: "EXIF DateTimeOriginal", isReal: true },
+      { fn: "analyze_image_authenticity", args: `file: "${milestonePhoto.name}", exif: ${meta.hasExif}`, result: null, status: null, sourceLabel: "Claude Vision API" },
+      { fn: "verify_subject_match", args: 'milestone: "Panel installation", expected: "solar panels on roof"', result: null, status: null, sourceLabel: "Claude Vision API" },
+      { fn: "check_location_consistency", args: 'expected: "school rooftop, urban Toronto"', result: null, status: null, sourceLabel: "Claude Vision API" },
+      { fn: "assess_scale_plausibility", args: 'budget: "$62,500", phase: "Panel installation"', result: null, status: null, sourceLabel: "Claude Vision API" },
+      { fn: "verify_electrical_permit", args: 'permit: "2025-ET-4421", municipality: "City of Toronto"', result: null, status: null, sourceLabel: "Toronto Building Permits" },
+    ]);
+    const t0 = performance.now();
+
+    // Store secondary results for display
+    setMilestoneSecondary({ gps: gpsResult, timestamp: timestampResult, permit: null });
+
+    try {
+      const solarProject = COMMUNITY_PROJECTS[0];
+      const result = await runPhotoVerification(milestonePhoto, {
+        projectTitle: solarProject.title,
+        creator: solarProject.creator,
+        milestoneName: "Panel installation",
+        evidenceDescription: "Solar panels installed on school rooftop",
+        location: solarProject.location,
+        projectDescription: solarProject.description,
+      });
+
+      // Stream vision trace entries sequentially (indices 3-6)
+      const dimensions = [
+        { key: "authenticity", idx: 3 },
+        { key: "subject_match", idx: 4 },
+        { key: "location_consistency", idx: 5 },
+        { key: "scale_plausibility", idx: 6 },
+      ];
+
+      for (let i = 0; i < dimensions.length; i++) {
+        await new Promise(r => setTimeout(r, i === 0 ? 0 : 500));
+        const dim = dimensions[i];
+        const dimResult = result[dim.key];
+        setMilestonePhotoTrace(prev => {
+          const updated = [...prev];
+          updated[dim.idx] = {
+            ...updated[dim.idx],
+            result: dimResult?.reasoning || "No data",
+            status: dimResult?.status || "unable_to_verify",
+            isReal: true,
+          };
+          return updated;
+        });
+      }
+
+      // After vision completes, add permit lookup trace (hardcoded for demo — would be a real API call in production)
+      await new Promise(r => setTimeout(r, 500));
+      const permitResult = { status: "verified", detail: "Active electrical permit #2025-ET-4421 found in City of Toronto database — issued to Riverdale Community Energy Co-op" };
+      setMilestonePhotoTrace(prev => {
+        const updated = [...prev];
+        updated[7] = {
+          ...updated[7],
+          result: permitResult.detail,
+          status: permitResult.status,
+          isReal: false,
+          source: "https://www.toronto.ca/city-government/planning-development/building-permits-renovation/",
+        };
+        return updated;
+      });
+      setMilestoneSecondary(prev => ({ ...prev, permit: permitResult }));
+
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      setMilestonePhotoResult(result);
+      setMilestonePhotoElapsed(elapsed);
+    } catch (e) {
+      console.error("Photo verification failed:", e);
+      setMilestonePhotoTrace(prev => prev.map(t => ({
+        ...t,
+        result: t.result || `Error: ${e.message}`,
+        status: t.status || "error",
+      })));
+    }
+    setMilestonePhotoVerifying(false);
+  };
+
+  const verifySteps = ["Searching public records...", "Cross-referencing CRA database...", "Checking municipal partner directories...", "Analyzing budget benchmarks..."];
+
+  // Hardcoded trace entries for checks 2-6 (streamed after the real registry lookup)
+  const hardcodedTraceEntries = [
+    { fn: "check_municipal_directory", args: '"City of Toronto Parks Department", partner: "Community Living Toronto"', result: "No partnership record in directory", status: "discrepancy", source: "https://www.toronto.ca/city-government/accountability-operations-customer-service/city-administration/city-managers-office/agencies-corporations/", sourceLabel: "City of Toronto Partner Directory" },
+    { fn: "analyze_budget_benchmarks", args: 'type: "community_garden", amount: "$35,000", region: "Toronto"', result: "Within expected range ($25K–$50K for comparable scope)", status: "verified", source: "https://communitygarden.org/resources/", sourceLabel: "ACGA Benchmark Data" },
+    { fn: "verify_creator_identity", args: 'name: "Sarah Chen", org: "Community Living Toronto"', result: "Employee found — 8-year tenure unconfirmed", status: "unable_to_verify", source: "https://www.linkedin.com/search/results/people/", sourceLabel: "LinkedIn People Search" },
+    { fn: "verify_wealthsimple_business", args: 'org: "Community Living Toronto"', result: "No Wealthsimple Business account found", status: "unable_to_verify", source: null, sourceLabel: "Wealthsimple Business API" },
+  ];
+
+  const totalExpectedTraces = 1 + hardcodedTraceEntries.length; // 1 real + 5 hardcoded
+
+  const handleRunVerification = async () => {
+    if (!submittedProposal) return;
+    setVerifying(true);
+    setVerifyStep(0);
+    setLiveTrace([]);
+    setRegistryProof(null);
+    const t0 = performance.now();
+
+    const stepInterval = setInterval(() => {
+      setVerifyStep(p => {
+        if (p >= verifySteps.length - 1) { clearInterval(stepInterval); return p; }
+        return p + 1;
+      });
+    }, 900);
+
+    // Extract org name from team field: "Person Name, Org Name (details)" → "Org Name"
+    const orgName = submittedProposal.proposal.team?.match(/,\s*([^(]+)/)?.[1]?.replace(/\.\s*Partnership.*$/i, "").trim()
+      || submittedProposal.proposal.title || "organization";
+
+    // Step 1: Show the registry call (real tool-use)
+    setLiveTrace([{
+      fn: "search_charity_registry",
+      args: `"${orgName}", province: "ON"`,
+      result: null, status: null,
+      source: "https://open.canada.ca/data/en/dataset/05b3abd0-e70f-4b3b-a9c5-acc436bd15b6",
+      sourceLabel: "CRA Charity Database (Open Data)",
+    }]);
+
+    // Step 2: Run the real tool-use call
+    let registryResult = null;
+    try {
+      registryResult = await runRegistryVerification(orgName, null,
+        (toolCall) => {
+          // Claude made the tool call — store the raw tool_use block as proof
+          setRegistryProof(prev => ({ ...prev, toolCall }));
+        },
+        (registryData) => {
+          // We fetched real data from the registry
+          setRegistryProof(prev => ({ ...prev, registryData }));
+        },
+        (interpretation) => {
+          // Claude interpreted the results
+          setRegistryProof(prev => ({ ...prev, interpretation }));
+        },
+      );
+    } catch (e) {
+      console.warn("Registry lookup failed:", e);
+      registryResult = { interpretation: null, toolCall: null, failed: true, error: e.message };
+      setRegistryProof(prev => ({ ...prev, error: e.message }));
+    }
+
+    // Step 3: Fill in the first trace entry with the real result
+    const registryFailed = registryResult?.failed || !registryResult?.interpretation;
+    const realResult = registryFailed
+      ? `Registry lookup failed: ${registryResult?.error || "No response from API"}`
+      : registryResult.interpretation;
+    const realStatus = registryFailed
+      ? "error"
+      : (realResult.toLowerCase().includes("not found") || realResult.toLowerCase().includes("no matching") || realResult.toLowerCase().includes("unable"))
+        ? "unable_to_verify"
+        : "verified";
+    setLiveTrace(prev => {
+      const updated = [...prev];
+      updated[0] = {
+        ...updated[0],
+        result: realResult.length > 120 ? realResult.slice(0, 117) + "..." : realResult,
+        status: realStatus,
+        isReal: true,
+        failed: registryFailed,
+      };
+      return updated;
+    });
+
+    // Store the full proof with raw API data
+    if (registryResult?.rawResponse) {
+      setRegistryProof(prev => ({ ...prev, rawResponse: registryResult.rawResponse }));
+    }
+
+    // Step 4: Stream remaining hardcoded entries
+    let hIdx = 0;
+    let hShowingResult = false;
+    const hardcodedInterval = setInterval(() => {
+      if (hIdx >= hardcodedTraceEntries.length) {
+        clearInterval(hardcodedInterval);
+        return;
+      }
+      if (!hShowingResult) {
+        const entry = hardcodedTraceEntries[hIdx];
+        setLiveTrace(prev => [...prev, { fn: entry.fn, args: entry.args, result: null, status: null, source: entry.source, sourceLabel: entry.sourceLabel }]);
+        hShowingResult = true;
+      } else {
+        const entry = hardcodedTraceEntries[hIdx];
+        setLiveTrace(prev => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { ...entry };
+          return updated;
+        });
+        hShowingResult = false;
+        hIdx++;
+      }
+    }, 450);
+
+    // Step 5: After all traces done, show final results
+    const hardcodedTime = hardcodedTraceEntries.length * 2 * 450 + 800;
+    setTimeout(() => {
+      clearInterval(hardcodedInterval);
+      clearInterval(stepInterval);
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      const firstCheckDetail = realResult.length > 120 ? realResult.slice(0, 117) + "..." : realResult;
+      const finalFirstStatus = realStatus === "error" ? "unable_to_verify" : realStatus;
+      setVerificationResults([
+        { check: "Organization exists", action: "Search CRA Charity Database (live tool-use)", status: finalFirstStatus, detail: registryFailed ? "Registry lookup failed — manual verification required" : firstCheckDetail, automated_action: registryFailed ? "Auto-flagged: Registry lookup failed — retry or verify manually" : null },
+        { check: "Partnership claim", action: "Check Parks Dept partner directory", status: "discrepancy", detail: "No record in City of Toronto Parks Department partner directory", automated_action: "Auto-flagged: Creator notified — provide documentation or remove claim" },
+        { check: "Budget reasonableness", action: "Compare against similar project benchmarks", status: "verified", detail: "$35,000 within expected range for community garden scope", automated_action: null },
+        { check: "Creator credentials", action: "Search organizational directories", status: "unable_to_verify", detail: "Sarah Chen found at Community Living Toronto — 8-year tenure unconfirmed", automated_action: "Auto-requested: LinkedIn or organizational reference requested" },
+        { check: "Wealthsimple Business account", action: "Check Wealthsimple Business directory", status: "unable_to_verify", detail: "No WS Business account found for Community Living Toronto", automated_action: "Auto-sent: Invitation to link WS Business account" },
+      ]);
+      setVerificationElapsed(elapsed);
+      setVerifying(false);
+    }, hardcodedTime);
+  };
+
+  const retryRegistryLookup = async () => {
+    const orgName = submittedProposal?.proposal?.team?.match(/,\s*([^(]+)/)?.[1]?.replace(/\.\s*Partnership.*$/i, "").trim()
+      || submittedProposal?.proposal?.title || "organization";
+
+    // Reset first trace entry to "awaiting"
+    setLiveTrace(prev => {
+      const updated = [...prev];
+      updated[0] = { ...updated[0], result: null, status: null, failed: false, isReal: true };
+      return updated;
+    });
+    setRegistryProof(null);
+
+    // Also reset first verification result if it exists
+    if (verificationResults) {
+      setVerificationResults(prev => {
+        const updated = [...prev];
+        updated[0] = { ...updated[0], status: "verifying", detail: "Retrying registry lookup..." };
+        return updated;
+      });
+    }
+
+    let registryResult = null;
+    try {
+      registryResult = await runRegistryVerification(orgName, null,
+        (toolCall) => setRegistryProof(prev => ({ ...prev, toolCall })),
+        (registryData) => setRegistryProof(prev => ({ ...prev, registryData })),
+        (interpretation) => setRegistryProof(prev => ({ ...prev, interpretation })),
+      );
+    } catch (e) {
+      console.warn("Registry retry failed:", e);
+      registryResult = { interpretation: null, toolCall: null, failed: true, error: e.message };
+      setRegistryProof(prev => ({ ...prev, error: e.message }));
+    }
+
+    const registryFailed = registryResult?.failed || !registryResult?.interpretation;
+    const realResult = registryFailed
+      ? `Registry lookup failed: ${registryResult?.error || "No response from API"}`
+      : registryResult.interpretation;
+    const realStatus = registryFailed
+      ? "error"
+      : (realResult.toLowerCase().includes("not found") || realResult.toLowerCase().includes("no matching") || realResult.toLowerCase().includes("unable"))
+        ? "unable_to_verify"
+        : "verified";
+
+    setLiveTrace(prev => {
+      const updated = [...prev];
+      updated[0] = { ...updated[0], result: realResult.length > 120 ? realResult.slice(0, 117) + "..." : realResult, status: realStatus, isReal: true, failed: registryFailed };
+      return updated;
+    });
+
+    // Update verification results row too
+    if (verificationResults) {
+      const firstCheckDetail = realResult.length > 120 ? realResult.slice(0, 117) + "..." : realResult;
+      const finalFirstStatus = realStatus === "error" ? "unable_to_verify" : realStatus;
+      setVerificationResults(prev => {
+        const updated = [...prev];
+        updated[0] = { ...updated[0], status: finalFirstStatus, detail: registryFailed ? "Registry lookup failed — manual verification required" : firstCheckDetail, automated_action: registryFailed ? "Auto-flagged: Registry lookup failed — retry or verify manually" : null };
+        return updated;
+      });
+    }
+  };
+
+  const prePopulated = [
+    { id: "solar", title: "Riverdale Community Solar Garden", creator: "Riverdale Community Energy Co-op", category: "environment", risk: "Low", riskColor: COLORS.green, unverified: 0, timeAgo: "3d ago", status: "Verification complete", wsVerified: true, wsSubtext: "Identity verified via WS Business · KYC complete since 2021" },
+    { id: "kensington", title: "Kensington Market Micro-Loans", creator: "Kensington Market BIA", category: "small_business", risk: "Medium", riskColor: "#B8860B", unverified: 1, timeAgo: "1d ago", status: "Awaiting review", wsVerified: true },
+  ];
+
+  const catLabel = id => CATEGORIES.find(c => c.id === id)?.label || id;
+  const catIcon = id => CATEGORIES.find(c => c.id === id)?.icon || "";
+
+  const statusIcon = s => s === "verified" ? "✓" : s === "discrepancy" ? "✗" : s === "verifying" ? "⟳" : "⚠";
+  const statusColor = s => s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : s === "verifying" ? COLORS.accent : "#B8860B";
+  const statusBg = s => s === "verified" ? COLORS.greenLight : s === "discrepancy" ? COLORS.redLight : s === "verifying" ? "#FFF7ED" : COLORS.yellowLight;
+  const statusLabel = s => s === "verified" ? "Verified" : s === "discrepancy" ? "Discrepancy" : s === "verifying" ? "Retrying..." : "Unable to verify";
+
+  const verifiedCount = verificationResults ? verificationResults.filter(r => r.status === "verified").length : 0;
+  const autoActions = verificationResults ? verificationResults.filter(r => r.automated_action).length : 0;
+
+  const followUps = verificationResults ? [
+    ...verificationResults.filter(r => r.automated_action && !r.automated_action.includes("flagged")).map(r => ({ item: r.check, tier: "automated", action: r.automated_action })),
+    ...verificationResults.filter(r => r.status === "discrepancy").map(r => ({ item: r.check, tier: "ai_drafted", action: r.automated_action || "Draft outreach ready for review", draft: r.check.toLowerCase().includes("partner") ? `Dear City of Toronto Parks Department,\n\nWe are verifying a partnership claim from Community Living Toronto regarding the Parkdale Community Garden Expansion project. They have listed your department as a partner in their funding proposal.\n\nCould you confirm whether this partnership exists and, if so, provide a brief description of the arrangement?\n\nThank you for your time.\n\nBest regards,\nSarah M.\nFundLocal Compliance Team` : `Dear project creator,\n\nAs part of our compliance review, we need additional documentation for the following claim: ${r.detail}\n\nPlease provide one of the following:\n- Official documentation or agreement\n- Contact reference who can confirm\n- Updated project description removing this claim\n\nThank you,\nFundLocal Compliance Team` })),
+    ...verificationResults.filter(r => r.status === "unable_to_verify" && !verificationResults.some(f => f.tier === "automated" && f.item === r.check)).filter(r => !r.automated_action?.includes("Auto-requested")).map(r => ({ item: r.check, tier: "ai_drafted", action: `Draft request to creator for documentation`, draft: `Dear project creator,\n\nWe were unable to verify: ${r.detail}\n\nPlease provide supporting documentation such as:\n- Registration numbers or certificates\n- Links to official profiles or directories\n- Letters of reference\n\nThank you,\nFundLocal Compliance Team` })),
+  ] : [];
+
+  const autoCount = followUps.filter(f => f.tier === "automated").length;
+  const draftCount = followUps.filter(f => f.tier === "ai_drafted").length;
+
+  // Milestone verification data
+  const milestoneProjects = [
+    {
+      id: "solar",
+      title: "Riverdale Community Solar Garden",
+      creator: "Riverdale Community Energy Co-op",
+      funded: 87500, goal: 125000,
+      currentMilestone: "Panel installation",
+      evidence: "12 installation photos, supplier invoice ($47,200), electrical permit #2025-ET-4421",
+      milestones: [
+        { name: "Site preparation & permits", amount: "$30,000", status: "released" },
+        { name: "Panel installation", amount: "$62,500", status: "pending" },
+        { name: "Grid connection", amount: "$32,500", status: "upcoming" },
+      ],
+      evidenceAnalysis: [
+        { evidence: "Installation photos (12)", analysis: "Image analysis: panels visible, matches site", status: "verified", detail: "Flat commercial roof, matches Riverdale Collegiate location" },
+        { evidence: "Supplier invoice ($47,200)", analysis: "Budget comparison: $62,500 allocated", status: "verified", detail: "75% of phase allocation. Consistent with phased install." },
+        { evidence: "Electrical permit #2025-ET-4421", analysis: "Municipal permit database lookup", status: "verified", detail: "Active permit found in City of Toronto database" },
+      ],
+    },
+    {
+      id: "stem",
+      title: "Moss Park Elementary STEM Lab",
+      creator: "Moss Park Elementary Parent Council",
+      funded: 31200, goal: 45000,
+      currentMilestone: "Lab renovation",
+      evidence: "Contractor invoice ($18,500), 8 before/after photos, building permit",
+      milestones: [
+        { name: "Equipment procurement", amount: "$15,000", status: "released" },
+        { name: "Lab renovation", amount: "$18,500", status: "pending" },
+        { name: "First class in new lab", amount: "$11,500", status: "upcoming" },
+      ],
+      evidenceAnalysis: [
+        { evidence: "Contractor invoice ($18,500)", analysis: "Budget comparison: $18,500 allocated", status: "verified", detail: "Matches phase allocation exactly." },
+        { evidence: "Before/after photos (8)", analysis: "Image analysis: renovation progress visible", status: "verified", detail: "Classroom transformation consistent with STEM lab conversion" },
+        { evidence: "Building permit", analysis: "Municipal permit database lookup", status: "verified", detail: "Active renovation permit for Moss Park Elementary" },
+      ],
+    },
+  ];
+
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: "40px 40px 100px", opacity: v ? 1 : 0, transform: v ? "none" : "translateY(12px)", transition: "all 0.6s cubic-bezier(0.16, 1, 0.3, 1)" }}>
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", bottom: 32, left: "50%", transform: "translateX(-50%)", padding: "12px 24px", borderRadius: 10, background: COLORS.dune, color: "#fff", fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 500, boxShadow: "0 4px 16px rgba(0,0,0,0.15)", zIndex: 1000, animation: "fadeIn 0.2s ease" }}>
+          {toast}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 32 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+            <span style={{ padding: "4px 12px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, background: COLORS.dune, color: "#fff", textTransform: "uppercase", letterSpacing: "0.08em" }}>Internal</span>
+            <h2 style={{ fontFamily: "'Libre Baskerville', Georgia, serif", fontSize: 28, fontWeight: 400, color: COLORS.dune }}>Compliance Review</h2>
+          </div>
+          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: COLORS.textSecondary }}>Reviewer: Sarah M. — Compliance Team</p>
+        </div>
+      </div>
+
+      {/* Tab bar */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 32, background: COLORS.cream, padding: 4, borderRadius: 10 }}>
+        {[{ key: "proposals", label: "Proposal Review" }, { key: "milestones", label: "Milestone Verification" }].map(tab => (
+          <button key={tab.key} onClick={() => setActiveTab(tab.key)} style={{ flex: 1, padding: "10px 20px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: activeTab === tab.key ? "#fff" : "transparent", color: activeTab === tab.key ? COLORS.dune : COLORS.textSecondary, boxShadow: activeTab === tab.key ? "0 1px 4px rgba(0,0,0,0.08)" : "none", transition: "all 0.2s" }}>{tab.label}</button>
+        ))}
+      </div>
+
+      {/* Stats row */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 32 }}>
+        {[
+          { label: "Proposals in queue", value: submittedProposal ? "3" : "2" },
+          { label: "Milestones pending", value: "2" },
+          { label: "AI pre-screened", value: "100%" },
+          { label: "Avg review", value: "~12 min", sub: "previously ~4 hrs" },
+        ].map((stat, i) => (
+          <div key={i} style={{ padding: 16, borderRadius: 12, background: COLORS.warmWhite, textAlign: "center" }}>
+            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 10, fontWeight: 600, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{stat.label}</p>
+            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 20, fontWeight: 700, color: COLORS.dune }}>{stat.value}</p>
+            {stat.sub && <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: COLORS.textTertiary, marginTop: 2 }}>{stat.sub}</p>}
+          </div>
+        ))}
+      </div>
+
+      {/* TAB 1: Proposal Review */}
+      {activeTab === "proposals" && (
+        <div>
+          {/* Queue list — hidden when a proposal is focused */}
+          {!expandedProposal && (
+            <>
+              {submittedProposal && (
+                <div onClick={() => setExpandedProposal("new")} style={{ padding: 20, borderRadius: 12, border: `2px solid ${COLORS.accent}`, background: "#fff", marginBottom: 12, cursor: "pointer", transition: "all 0.2s" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1 }}>
+                      <span style={{ padding: "3px 8px", borderRadius: 100, fontSize: 10, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, background: COLORS.accent, color: "#fff" }}>New</span>
+                      <div>
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 15, fontWeight: 600, color: COLORS.dune }}>{submittedProposal.proposal.title || "Untitled Proposal"}</p>
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>{submittedProposal.proposal.team || "Unknown creator"}</p>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      {submittedProposal.proposal.category && <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 500, background: COLORS.cream, color: COLORS.textSecondary }}>{catIcon(submittedProposal.proposal.category)} {catLabel(submittedProposal.proposal.category)}</span>}
+                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.yellowLight, color: "#B8860B" }}>Pending review</span>
+                      <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary }}>Just now</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {prePopulated.map(item => (
+                <div key={item.id} onClick={() => setExpandedProposal(item.id)} style={{ padding: 20, borderRadius: 12, border: `1px solid ${COLORS.border}`, background: "#fff", marginBottom: 12, cursor: "pointer", transition: "all 0.2s" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1 }}>
+                      <div>
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 15, fontWeight: 600, color: COLORS.dune }}>{item.title}</p>
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>{item.creator}</p>
+                        {item.wsSubtext && <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: COLORS.green, marginTop: 2 }}>{item.wsSubtext}</p>}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 500, background: COLORS.cream, color: COLORS.textSecondary }}>{catIcon(item.category)} {catLabel(item.category)}</span>
+                      {item.wsVerified && <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.greenLight, color: COLORS.green }}>WS Verified</span>}
+                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: item.risk === "Low" ? COLORS.greenLight : COLORS.yellowLight, color: item.riskColor }}>{item.risk} risk</span>
+                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 500, background: item.status === "Verification complete" ? COLORS.greenLight : COLORS.yellowLight, color: item.status === "Verification complete" ? COLORS.green : "#B8860B" }}>{item.status}</span>
+                      <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary }}>{item.timeAgo}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* Focused detail view for submitted proposal */}
+          {expandedProposal === "new" && submittedProposal && (
+            <div>
+              {/* Back button */}
+              <button onClick={() => setExpandedProposal(null)} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 0", border: "none", background: "none", cursor: "pointer", fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.textSecondary, marginBottom: 16 }}>
+                ← Back to queue
+              </button>
+
+              {/* Proposal header */}
+              <div style={{ padding: 20, borderRadius: 12, border: `2px solid ${COLORS.accent}`, background: "#fff", marginBottom: 20 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+                      <span style={{ padding: "3px 8px", borderRadius: 100, fontSize: 10, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, background: COLORS.accent, color: "#fff" }}>New</span>
+                      <h3 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 18, fontWeight: 700, color: COLORS.dune }}>{submittedProposal.proposal.title || "Untitled Proposal"}</h3>
+                    </div>
+                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary }}>{submittedProposal.proposal.team || "Unknown creator"} · {submittedProposal.proposal.location || "N/A"} · Goal: {submittedProposal.proposal.goal || "N/A"}</p>
+                  </div>
+                  <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.yellowLight, color: "#B8860B" }}>Pending review</span>
+                </div>
+              </div>
+
+              <div style={{ padding: 28, borderRadius: 14, border: `1px solid ${COLORS.border}`, background: "#fff", marginBottom: 24 }}>
+                {/* AI Pre-Screening Report */}
+                <h3 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 16, fontWeight: 700, color: COLORS.dune, marginBottom: 16 }}>AI Pre-Screening Report</h3>
+
+                {submittedProposal.aiResult && (
+                  <>
+                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: COLORS.duneLight, lineHeight: 1.7, marginBottom: 20 }}>{submittedProposal.aiResult.overall_assessment}</p>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 20 }}>
+                      {Object.entries(submittedProposal.aiResult.scores).map(([k, val]) => {
+                        const rc = r => r === "High" ? COLORS.green : r === "Medium" ? "#B8860B" : COLORS.red;
+                        const rb = r => r === "High" ? COLORS.greenLight : r === "Medium" ? COLORS.yellowLight : COLORS.redLight;
+                        return (
+                          <div key={k} style={{ padding: 12, borderRadius: 10, background: rb(val.rating), textAlign: "center" }}>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 10, fontWeight: 600, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{k}</p>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 15, fontWeight: 700, color: rc(val.rating) }}>{val.rating}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Risk flags & unverified claims — combined */}
+                    {submittedProposal.aiResult.risk_flags?.length > 0 && (
+                      <div style={{ padding: 16, borderRadius: 10, background: COLORS.redLight, marginBottom: 20 }}>
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.red, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Flags & unverified claims</p>
+                        {submittedProposal.aiResult.risk_flags.map((f, i) => {
+                          const isUnverified = f.startsWith("UNVERIFIED:");
+                          return (
+                            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 4 }}>
+                              <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 9, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, background: isUnverified ? COLORS.blueLight : COLORS.redLight, color: isUnverified ? COLORS.blue : COLORS.red, flexShrink: 0, marginTop: 3 }}>{isUnverified ? "UNVERIFIED" : "RISK"}</span>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.dune, lineHeight: 1.5 }}>{f.replace("UNVERIFIED: ", "").replace("UNVERIFIED:", "")}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* Live AI Verification */}
+                <div style={{ borderTop: `1px solid ${COLORS.border}`, paddingTop: 20, marginTop: 8 }}>
+                  <h3 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 16, fontWeight: 700, color: COLORS.dune, marginBottom: 12 }}>AI Verification</h3>
+
+                  {!verificationResults && !verifying && (
+                    <button onClick={handleRunVerification} style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "12px 24px", borderRadius: 100, border: "none", background: COLORS.accent, color: "#fff", fontSize: 15, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer", transition: "all 0.2s" }}>
+                      <span style={{ fontSize: 14 }}>&#9881;</span> Run AI Verification
+                    </button>
+                  )}
+
+                  {verifying && (
+                    <div>
+                      <div style={{ padding: 24, borderRadius: 12, background: COLORS.warmWhite, textAlign: "center", marginBottom: 16 }}>
+                        <div style={{ width: 40, height: 40, borderRadius: "50%", border: `3px solid ${COLORS.border}`, borderTopColor: COLORS.accent, animation: "spin 0.8s linear infinite", margin: "0 auto 20px" }} />
+                        {verifySteps.map((s, i) => (
+                          <p key={i} style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: i <= verifyStep ? COLORS.dune : COLORS.textTertiary, opacity: i <= verifyStep ? 1 : 0.4, transition: "all 0.4s", marginBottom: 6, fontWeight: i === verifyStep ? 600 : 400 }}>
+                            {i < verifyStep ? "✓ " : i === verifyStep ? "→ " : ""}{s}
+                          </p>
+                        ))}
+                      </div>
+                      {liveTrace.length > 0 && (
+                        <AgentTracePanel trace={liveTrace.map((t, i) => i === 0 && t.failed ? { ...t, onRetry: retryRegistryLookup } : t)} collapsed={false} streaming={true} totalExpected={totalExpectedTraces} />
+                      )}
+                    </div>
+                  )}
+
+                  {verificationResults && (
+                    <div>
+                      {/* AI Recommendation — top of results */}
+                      {(() => {
+                        const hasDiscrepancy = verificationResults.some(r => r.status === "discrepancy");
+                        return (
+                          <div style={{ padding: 16, borderRadius: 10, background: hasDiscrepancy ? COLORS.yellowLight : COLORS.greenLight, border: `1px solid ${hasDiscrepancy ? COLORS.yellow : COLORS.green}`, marginBottom: 16 }}>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: hasDiscrepancy ? "#B8860B" : COLORS.green, marginBottom: 4 }}>
+                              {hasDiscrepancy ? "AI recommends: Request additional documentation before approval" : "AI recommends: Approve for listing"}
+                            </p>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>AI recommendation. Reviewer judgment is final.</p>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Status summary — above detail rows */}
+                      {(() => {
+                        const vc = verificationResults.filter(r => r.status === "verified").length;
+                        const uc = verificationResults.filter(r => r.status === "unable_to_verify").length;
+                        const dc = verificationResults.filter(r => r.status === "discrepancy").length;
+                        return (
+                          <div style={{ display: "flex", alignItems: "center", gap: 16, padding: "10px 16px", borderRadius: 10, background: COLORS.warmWhite, marginBottom: 12 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.green, display: "inline-block" }} />
+                              <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: COLORS.green }}>{vc} verified</span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#B8860B", display: "inline-block" }} />
+                              <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: "#B8860B" }}>{uc} unverified</span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.red, display: "inline-block" }} />
+                              <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: COLORS.red }}>{dc} discrepancy</span>
+                            </div>
+                            <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary, marginLeft: "auto" }}>{verificationElapsed}s</span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Verification results table */}
+                      <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 20 }}>
+                        {verificationResults.map((r, i) => (
+                          <div key={i} style={{ padding: "14px 16px", borderBottom: i < verificationResults.length - 1 ? `1px solid ${COLORS.border}` : "none", display: "flex", alignItems: "flex-start", gap: 12, borderLeft: `3px solid ${statusColor(r.status)}` }}>
+                            <div style={{ width: 28, height: 28, borderRadius: "50%", background: statusBg(r.status), display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 2 }}>
+                              <span style={{ fontSize: 14, fontWeight: 700, color: statusColor(r.status) }}>{statusIcon(r.status)}</span>
+                            </div>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                                <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune }}>{r.check}</p>
+                                <span style={{ padding: "2px 8px", borderRadius: 100, fontSize: 10, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: statusBg(r.status), color: statusColor(r.status) }}>{statusLabel(r.status)}</span>
+                              </div>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, lineHeight: 1.5 }}>{r.detail}</p>
+                              {r.automated_action && (
+                                <div style={{ marginTop: 6, display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 100, background: COLORS.blueLight, border: `1px solid ${COLORS.blue}` }}>
+                                  <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 600, color: COLORS.blue }}>Automated</span>
+                                  <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: COLORS.blue }}>{r.automated_action}</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Agent Activity Trace — always visible after verification */}
+                      <AgentTracePanel trace={buildAgentTrace(verificationResults).map((t, i) => i === 0 ? { ...t, isReal: true, failed: verificationResults[0]?.status === "unable_to_verify" && verificationResults[0]?.detail?.includes("failed"), onRetry: verificationResults[0]?.detail?.includes("failed") ? retryRegistryLookup : undefined } : t)} elapsed={verificationElapsed} />
+
+                      {/* Raw API Proof */}
+                      {registryProof && (
+                        <div style={{ borderRadius: 12, border: `1px solid ${registryProof.error ? COLORS.red : COLORS.green}`, overflow: "hidden", marginBottom: 20 }}>
+                          <div onClick={() => setDraftExpanded(prev => ({ ...prev, __proof: !prev.__proof }))} style={{ padding: "12px 16px", background: registryProof.error ? COLORS.redLight : COLORS.greenLight, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 700, color: registryProof.error ? COLORS.red : COLORS.green }}>{registryProof.error ? "API Call Failed" : "Raw API Proof"}</span>
+                              <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: registryProof.error ? COLORS.red : COLORS.green }}>— {registryProof.error ? registryProof.error : "Claude tool_use response + CRA Charity Database"}</span>
+                            </div>
+                            <span style={{ fontSize: 12, color: registryProof.error ? COLORS.red : COLORS.green, transition: "transform 0.2s", transform: draftExpanded.__proof ? "rotate(180deg)" : "rotate(0deg)" }}>&#9660;</span>
+                          </div>
+                          {draftExpanded.__proof && (
+                            <div style={{ padding: "16px 20px", background: "#0d1117", fontFamily: "'DM Mono', 'Fira Code', monospace", fontSize: 12, lineHeight: 1.7, maxHeight: 400, overflowY: "auto" }}>
+                              {registryProof.toolCall && (
+                                <div style={{ marginBottom: 16 }}>
+                                  <div style={{ color: "#4ade80", fontWeight: 700, marginBottom: 8 }}>1. Claude's tool_use request (from API response):</div>
+                                  <pre style={{ color: "#e2e8f0", whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}>{JSON.stringify(registryProof.toolCall, null, 2)}</pre>
+                                </div>
+                              )}
+                              {registryProof.registryData && (
+                                <div style={{ marginBottom: 16 }}>
+                                  <div style={{ color: "#60a5fa", fontWeight: 700, marginBottom: 8 }}>2. Data fetched from CRA Charity Database (Open Data):</div>
+                                  <pre style={{ color: "#94a3b8", whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}>{registryProof.registryData.slice(0, 1500)}{registryProof.registryData.length > 1500 ? "\n..." : ""}</pre>
+                                </div>
+                              )}
+                              {registryProof.interpretation && (
+                                <div>
+                                  <div style={{ color: "#fbbf24", fontWeight: 700, marginBottom: 8 }}>3. Claude's interpretation of registry data:</div>
+                                  <pre style={{ color: "#e2e8f0", whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}>{registryProof.interpretation}</pre>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* AI-Assisted Follow-ups */}
+                      <div style={{ borderTop: `1px solid ${COLORS.border}`, paddingTop: 20, marginBottom: 20 }}>
+                        <h3 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 16, fontWeight: 700, color: COLORS.dune, marginBottom: 12 }}>AI-Assisted Follow-ups</h3>
+
+                        {followUps.map((f, i) => (
+                          <div key={i} style={{ padding: 14, borderRadius: 10, border: `1px solid ${COLORS.border}`, background: "#fff", marginBottom: 8 }}>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 10, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, background: f.tier === "automated" ? COLORS.greenLight : COLORS.blueLight, color: f.tier === "automated" ? COLORS.green : COLORS.blue, textTransform: "uppercase" }}>{f.tier === "automated" ? "Automated" : "AI-drafted"}</span>
+                                <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune }}>{f.item}</p>
+                              </div>
+                              {f.tier === "ai_drafted" && f.draft && (
+                                <button onClick={(e) => { e.stopPropagation(); setDraftExpanded(prev => ({ ...prev, [i]: !prev[i] })); }} style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600, color: COLORS.blue, background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+                                  {draftExpanded[i] ? "Hide draft" : "View draft"}
+                                </button>
+                              )}
+                            </div>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, marginTop: 4 }}>{f.action}</p>
+                            {draftExpanded[i] && f.draft && (
+                              <div style={{ marginTop: 10, padding: 14, borderRadius: 8, background: COLORS.warmWhite, border: `1px solid ${COLORS.border}` }}>
+                                <p style={{ fontFamily: "'DM Sans', monospace", fontSize: 13, color: COLORS.duneLight, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{f.draft}</p>
+                                <button onClick={() => showToast("Coming soon — send functionality in development")} style={{ marginTop: 10, padding: "8px 20px", borderRadius: 100, border: "none", background: COLORS.dune, color: "#fff", fontSize: 13, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Send</button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+
+                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, lineHeight: 1.6, marginTop: 12, padding: "10px 14px", borderRadius: 8, background: COLORS.warmWhite }}>
+                          AI resolved {verifiedCount} checks automatically. {autoCount} auto-requested from creator. {draftCount} drafts ready for reviewer to send. 0 require manual research.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Reviewer Actions — sticky at bottom */}
+                <div style={{ borderTop: `1px solid ${COLORS.border}`, paddingTop: 20 }}>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button onClick={() => showToast("Proposal approved for listing")} style={{ flex: 1, padding: "12px", borderRadius: 100, border: "none", background: COLORS.green, color: "#fff", fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Approve for listing</button>
+                    <button onClick={() => showToast("More info requested from creator")} style={{ flex: 1, padding: "12px", borderRadius: 100, border: `1.5px solid ${COLORS.border}`, background: "#fff", color: COLORS.dune, fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Request more info</button>
+                    <button onClick={() => showToast("Proposal rejected")} style={{ padding: "12px 20px", borderRadius: 100, border: `1.5px solid ${COLORS.redLight}`, background: COLORS.redLight, color: COLORS.red, fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Reject</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: Milestone Verification */}
+      {activeTab === "milestones" && (
+        <div>
+          {/* Queue list — hidden when focused */}
+          {!expandedMilestone && milestoneProjects.map(proj => {
+            const pct = Math.round((proj.funded / proj.goal) * 100);
+            return (
+              <div key={proj.id} onClick={() => setExpandedMilestone(proj.id)} style={{ padding: 20, borderRadius: 12, border: `1px solid ${COLORS.border}`, background: "#fff", marginBottom: 12, cursor: "pointer", transition: "all 0.2s" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div>
+                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 16, fontWeight: 600, color: COLORS.dune }}>{proj.title}</p>
+                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>{proj.creator}</p>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                    <div style={{ textAlign: "right" }}>
+                      <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune }}>${proj.funded.toLocaleString()} / ${proj.goal.toLocaleString()}</p>
+                      <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary }}>{pct}% funded</p>
+                    </div>
+                    <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.yellowLight, color: "#B8860B" }}>{proj.currentMilestone}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Focused milestone detail view */}
+          {expandedMilestone && (() => {
+            const proj = milestoneProjects.find(p => p.id === expandedMilestone);
+            if (!proj) return null;
+            const pct = Math.round((proj.funded / proj.goal) * 100);
+            return (
+              <div>
+                {/* Back button */}
+                <button onClick={() => setExpandedMilestone(null)} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 0", border: "none", background: "none", cursor: "pointer", fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.textSecondary, marginBottom: 16 }}>
+                  ← Back to queue
+                </button>
+
+                {/* Project header */}
+                <div style={{ padding: 20, borderRadius: 12, border: `1px solid ${COLORS.dune}`, background: "#fff", marginBottom: 20 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <h3 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 18, fontWeight: 700, color: COLORS.dune, marginBottom: 4 }}>{proj.title}</h3>
+                      <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary }}>{proj.creator} · ${proj.funded.toLocaleString()} / ${proj.goal.toLocaleString()} ({pct}% funded)</p>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      {proj.id === "solar" && <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.greenLight, color: COLORS.green }}>WS Verified</span>}
+                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 11, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.yellowLight, color: "#B8860B" }}>{proj.currentMilestone}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ padding: 28, borderRadius: 14, border: `1px solid ${COLORS.border}`, background: "#fff" }}>
+                  <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, marginBottom: 20 }}>
+                    <span style={{ fontWeight: 600, color: COLORS.dune }}>Evidence submitted:</span> {proj.evidence}
+                  </p>
+
+                  {/* Live Photo Verification */}
+                  {proj.id === "solar" && (
+                    <div style={{ marginBottom: 24 }}>
+                      <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 700, color: COLORS.dune, marginBottom: 12 }}>Live Photo Verification</h4>
+
+                      {/* Upload zone */}
+                      <div style={{ padding: 20, borderRadius: 12, border: `2px dashed ${milestonePhoto ? COLORS.green : COLORS.border}`, background: milestonePhoto ? COLORS.greenLight + "33" : COLORS.warmWhite, textAlign: "center", marginBottom: 16, transition: "all 0.2s" }}>
+                        {!milestonePhoto ? (
+                          <label style={{ cursor: "pointer", display: "block" }}>
+                            <input type="file" accept=".jpg,.jpeg,.png,.webp" style={{ display: "none" }} onChange={e => e.target.files?.[0] && handleMilestonePhoto(e.target.files[0])} />
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 24, marginBottom: 8 }}>📷</p>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune, marginBottom: 4 }}>Upload photo for AI verification</p>
+                            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary }}>JPG, PNG, or WebP — milestone evidence photo</p>
+                          </label>
+                        ) : (
+                          <div style={{ display: "flex", alignItems: "flex-start", gap: 20, textAlign: "left" }}>
+                            <img src={milestonePhotoPreview} alt="Preview" style={{ width: 240, height: 180, objectFit: "cover", borderRadius: 10, border: `3px solid ${milestonePhotoResult ? (milestonePhotoResult.overall_verdict === "verified" ? COLORS.green : milestonePhotoResult.overall_verdict === "discrepancy" ? COLORS.red : COLORS.yellow) : COLORS.border}`, cursor: "pointer" }} onClick={() => window.open(milestonePhotoPreview, "_blank")} />
+                            <div style={{ flex: 1 }}>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune, marginBottom: 4 }}>{milestonePhoto.name}</p>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary, marginBottom: 12 }}>{(milestonePhoto.size / 1024).toFixed(0)} KB · {milestonePhoto.type}</p>
+                              <button onClick={() => { setMilestonePhoto(null); setMilestonePhotoPreview(null); setMilestonePhotoResult(null); setMilestonePhotoTrace([]); setMilestonePhotoElapsed(null); setMilestoneSecondary(null); }} style={{ padding: "6px 14px", borderRadius: 100, border: `1px solid ${COLORS.border}`, background: "#fff", color: COLORS.textSecondary, fontSize: 12, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Remove</button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Run verification button */}
+                      {milestonePhoto && !milestonePhotoResult && (
+                        <button onClick={handlePhotoVerification} disabled={milestonePhotoVerifying} style={{ width: "100%", padding: "12px", borderRadius: 100, border: "none", background: milestonePhotoVerifying ? COLORS.duneLight : COLORS.dune, color: "#fff", fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: milestonePhotoVerifying ? "not-allowed" : "pointer", marginBottom: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                          {milestonePhotoVerifying && <span style={{ width: 16, height: 16, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", display: "inline-block", animation: "spin 0.8s linear infinite" }} />}
+                          {milestonePhotoVerifying ? "Verifying..." : "Run AI Photo Verification"}
+                        </button>
+                      )}
+
+                      {/* Verification trace — always visible after run */}
+                      {milestonePhotoTrace.length > 0 && (
+                        <AgentTracePanel trace={milestonePhotoTrace} elapsed={milestonePhotoElapsed} collapsed={!milestonePhotoVerifying} streaming={milestonePhotoVerifying} totalExpected={8} />
+                      )}
+
+                      {/* Verification results — unified table with all checks */}
+                      {milestonePhotoResult && (
+                        <div>
+                          {/* Overall verdict banner — top */}
+                          {(() => {
+                            const v = milestonePhotoResult.overall_verdict;
+                            const secondaryFlags = milestoneSecondary ? [milestoneSecondary.gps, milestoneSecondary.timestamp, milestoneSecondary.permit].filter(Boolean) : [];
+                            const hasSecondaryDiscrepancy = secondaryFlags.some(f => f.status === "discrepancy");
+                            const allSecondaryUnverifiable = secondaryFlags.length > 0 && secondaryFlags.every(f => f.status === "unable_to_verify");
+                            const effectiveVerdict = hasSecondaryDiscrepancy ? "discrepancy" : v === "verified" && allSecondaryUnverifiable ? "unable_to_verify" : v;
+                            const bannerBg = effectiveVerdict === "verified" ? COLORS.greenLight : effectiveVerdict === "discrepancy" ? COLORS.redLight : COLORS.yellowLight;
+                            const bannerBorder = effectiveVerdict === "verified" ? COLORS.green : effectiveVerdict === "discrepancy" ? COLORS.red : COLORS.yellow;
+                            const bannerColor = effectiveVerdict === "verified" ? COLORS.green : effectiveVerdict === "discrepancy" ? COLORS.red : "#B8860B";
+                            const secondaryNote = hasSecondaryDiscrepancy
+                              ? " Secondary checks flagged discrepancies."
+                              : allSecondaryUnverifiable && v === "verified"
+                                ? " Vision passed but no EXIF metadata to independently verify."
+                                : "";
+                            return (
+                              <div style={{ padding: 14, borderRadius: 10, background: bannerBg, border: `1px solid ${bannerBorder}`, marginBottom: 12 }}>
+                                <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: bannerColor, marginBottom: 2 }}>
+                                  {effectiveVerdict === "verified" ? "Photo verified" : effectiveVerdict === "discrepancy" ? "Discrepancy detected" : "Unable to fully verify"}
+                                </p>
+                                <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary }}>{milestonePhotoResult.summary}{secondaryNote}</p>
+                              </div>
+                            );
+                          })()}
+
+                          {/* Layer 1: Client-side metadata forensics */}
+                          {milestoneSecondary && (
+                            <>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Layer 1 — Client-side Forensics <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>(zero API cost)</span></p>
+                              <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 16 }}>
+                                {[
+                                  { key: "metadata", label: "File metadata & EXIF", category: "metadata" },
+                                  { key: "gps", label: "GPS geolocation", category: "metadata" },
+                                  { key: "timestamp", label: "Photo timestamp", category: "metadata" },
+                                ].map((dim, i, arr) => {
+                                  const d = dim.key === "metadata"
+                                    ? { status: milestonePhotoTrace[0]?.status || "unable_to_verify", detail: milestonePhotoTrace[0]?.result || "Awaiting..." }
+                                    : milestoneSecondary?.[dim.key];
+                                  const s = d?.status || "unable_to_verify";
+                                  const reasoning = d?.detail || d?.reasoning || "Awaiting verification...";
+                                  const borderColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : COLORS.yellow;
+                                  const bg = s === "verified" ? COLORS.greenLight : s === "discrepancy" ? COLORS.redLight : COLORS.yellowLight;
+                                  const icon = s === "verified" ? "✓" : s === "discrepancy" ? "✗" : "⚠";
+                                  const iconColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : "#B8860B";
+                                  return (
+                                    <div key={dim.key} style={{ padding: "12px 16px", borderBottom: i < arr.length - 1 ? `1px solid ${COLORS.border}` : "none", borderLeft: `4px solid ${borderColor}`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+                                      <div style={{ width: 26, height: 26, borderRadius: "50%", background: bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 2 }}>
+                                        <span style={{ fontSize: 13, fontWeight: 700, color: iconColor }}>{icon}</span>
+                                      </div>
+                                      <div style={{ flex: 1 }}>
+                                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: COLORS.dune }}>{dim.label}</p>
+                                          <span style={{ padding: "1px 7px", borderRadius: 100, fontSize: 9, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: bg, color: iconColor }}>{s === "verified" ? "Verified" : s === "discrepancy" ? "Discrepancy" : "Unverified"}</span>
+                                        </div>
+                                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary, lineHeight: 1.5 }}>{reasoning}</p>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </>
+                          )}
+
+                          {/* Layer 2: AI Vision analysis */}
+                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Layer 2 — AI Vision Analysis <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>(Claude Vision API)</span></p>
+                          <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 16 }}>
+                            {[
+                              { key: "authenticity", label: "Photo authenticity" },
+                              { key: "subject_match", label: "Subject match" },
+                              { key: "location_consistency", label: "Location consistency" },
+                              { key: "scale_plausibility", label: "Scale plausibility" },
+                            ].map((dim, i, arr) => {
+                              const d = milestonePhotoResult[dim.key];
+                              const s = d?.status || "unable_to_verify";
+                              const reasoning = d?.reasoning || "No data";
+                              const borderColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : COLORS.yellow;
+                              const bg = s === "verified" ? COLORS.greenLight : s === "discrepancy" ? COLORS.redLight : COLORS.yellowLight;
+                              const icon = s === "verified" ? "✓" : s === "discrepancy" ? "✗" : "⚠";
+                              const iconColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : "#B8860B";
+                              return (
+                                <div key={dim.key} style={{ padding: "12px 16px", borderBottom: i < arr.length - 1 ? `1px solid ${COLORS.border}` : "none", borderLeft: `4px solid ${borderColor}`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+                                  <div style={{ width: 26, height: 26, borderRadius: "50%", background: bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 2 }}>
+                                    <span style={{ fontSize: 13, fontWeight: 700, color: iconColor }}>{icon}</span>
+                                  </div>
+                                  <div style={{ flex: 1 }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                                      <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: COLORS.dune }}>{dim.label}</p>
+                                      <span style={{ padding: "1px 7px", borderRadius: 100, fontSize: 9, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: bg, color: iconColor }}>{s === "verified" ? "Verified" : s === "discrepancy" ? "Discrepancy" : "Unverified"}</span>
+                                    </div>
+                                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary, lineHeight: 1.5 }}>{reasoning}</p>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {/* Layer 3: External verification */}
+                          {milestoneSecondary?.permit && (
+                            <>
+                              <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Layer 3 — External Verification <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>(registry lookup)</span></p>
+                              <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 16 }}>
+                                {(() => {
+                                  const d = milestoneSecondary.permit;
+                                  const s = d?.status || "unable_to_verify";
+                                  const reasoning = d?.detail || "Awaiting verification...";
+                                  const borderColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : COLORS.yellow;
+                                  const bg = s === "verified" ? COLORS.greenLight : s === "discrepancy" ? COLORS.redLight : COLORS.yellowLight;
+                                  const icon = s === "verified" ? "✓" : s === "discrepancy" ? "✗" : "⚠";
+                                  const iconColor = s === "verified" ? COLORS.green : s === "discrepancy" ? COLORS.red : "#B8860B";
+                                  return (
+                                    <div style={{ padding: "12px 16px", borderLeft: `4px solid ${borderColor}`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+                                      <div style={{ width: 26, height: 26, borderRadius: "50%", background: bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 2 }}>
+                                        <span style={{ fontSize: 13, fontWeight: 700, color: iconColor }}>{icon}</span>
+                                      </div>
+                                      <div style={{ flex: 1 }}>
+                                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600, color: COLORS.dune }}>Electrical permit</p>
+                                          <span style={{ padding: "1px 7px", borderRadius: 100, fontSize: 9, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: bg, color: iconColor }}>{s === "verified" ? "Verified" : s === "discrepancy" ? "Discrepancy" : "Unverified"}</span>
+                                        </div>
+                                        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary, lineHeight: 1.5 }}>{reasoning}</p>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* AI Evidence Analysis */}
+                  <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 700, color: COLORS.dune, marginBottom: 12 }}>AI Evidence Analysis</h4>
+                  <div style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, overflow: "hidden", marginBottom: 24 }}>
+                    {proj.evidenceAnalysis.map((ev, i) => (
+                      <div key={i} style={{ padding: "14px 16px", borderBottom: i < proj.evidenceAnalysis.length - 1 ? `1px solid ${COLORS.border}` : "none", display: "flex", alignItems: "flex-start", gap: 12 }}>
+                        <div style={{ width: 28, height: 28, borderRadius: "50%", background: COLORS.greenLight, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 2 }}>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.green }}>✓</span>
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune, marginBottom: 2 }}>{ev.evidence}</p>
+                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textTertiary, marginBottom: 4 }}>{ev.analysis}</p>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ padding: "2px 8px", borderRadius: 100, fontSize: 10, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, background: COLORS.greenLight, color: COLORS.green }}>Consistent</span>
+                            <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary }}>{ev.detail}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Agent Activity Trace (static for milestones) */}
+                  {proj.id === "solar" && <AgentTracePanel trace={MILESTONE_AGENT_TRACE} elapsed="1.8" />}
+
+                  {/* Milestone Timeline */}
+                  <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 700, color: COLORS.dune, marginBottom: 12 }}>Milestone Timeline</h4>
+                  <div style={{ marginBottom: 24 }}>
+                    {proj.milestones.map((m, i) => (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 12 }}>
+                        <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: m.status === "released" ? COLORS.green : m.status === "pending" ? COLORS.accent : COLORS.border }}>
+                          <span style={{ color: "#fff", fontSize: 12, fontWeight: 700 }}>{m.status === "released" ? "✓" : m.status === "pending" ? "→" : "○"}</span>
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.dune }}>{m.name} — {m.amount} {m.status === "released" ? "released" : m.status === "pending" ? "pending" : "upcoming"}</p>
+                          {m.status === "pending" && <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.accent, fontWeight: 600 }}>← Evidence under review</p>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Payout Decision */}
+                  <div style={{ padding: 16, borderRadius: 10, background: COLORS.greenLight, border: `1px solid ${COLORS.green}`, marginBottom: 16 }}>
+                    <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 600, color: COLORS.green }}>All {proj.evidenceAnalysis.length} evidence items verified by AI. 0 require manual review.</p>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button onClick={() => showToast(`Payout of ${proj.milestones.find(m => m.status === "pending")?.amount || ""} approved`)} style={{ flex: 1, padding: "12px", borderRadius: 100, border: "none", background: COLORS.green, color: "#fff", fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Approve payout — {proj.milestones.find(m => m.status === "pending")?.amount || ""}</button>
+                    <button onClick={() => showToast("Payout held for further review")} style={{ padding: "12px 24px", borderRadius: 100, border: `1.5px solid ${COLORS.border}`, background: "#fff", color: COLORS.dune, fontSize: 14, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: "pointer" }}>Hold for review</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } } @keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
 export default function App() {
-  const [screen, setScreen] = useState("welcome");
-  const [view, setView] = useState("investor");
+  const [screen, setScreen] = useState("compliance");
+  const [view, setView] = useState("compliance");
   const [profile, setProfile] = useState(null);
   const [selProject, setSelProject] = useState(null);
   const [investments, setInvestments] = useState([]);
   const [matchedProjects, setMatchedProjects] = useState([]);
   const [matchFallback, setMatchFallback] = useState(false);
+  const [submittedProposal, setSubmittedProposal] = useState(DEMO_PROPOSAL);
+
+  const jumpToComplianceDemo = () => {
+    setSubmittedProposal(DEMO_PROPOSAL);
+    setView("compliance");
+    setScreen("compliance");
+  };
+
+  useEffect(() => {
+    const handler = e => {
+      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        jumpToComplianceDemo();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  const handleCreatorSubmit = (proposal, aiResult) => {
+    setSubmittedProposal({ proposal, aiResult });
+    setScreen("compliance");
+  };
 
   const start = v => {
     if (v === "creator_landing") { setView("creator"); setScreen("creator_landing"); }
@@ -1103,7 +2738,7 @@ export default function App() {
   return (
     <div style={{ background: "#fff", minHeight: "100vh", fontFamily: "'DM Sans', sans-serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Libre+Baskerville:wght@400;700&display=swap" rel="stylesheet" />
-      {screen !== "welcome" && <Nav currentView={view} setCurrentView={setView} setScreen={setScreen} />}
+      {screen !== "welcome" && <Nav currentView={view} setCurrentView={setView} setScreen={setScreen} onComplianceDemo={jumpToComplianceDemo} />}
       {screen === "welcome" && <>
         <WelcomeNav />
         <WelcomeScreen onStart={start} />
@@ -1113,7 +2748,8 @@ export default function App() {
       {screen === "detail" && selProject && <ProjectDetail project={selProject} onBack={() => setScreen("matches")} onApprove={(p, a) => { setInvestments(prev => [...prev, { project: p, amount: a }]); setScreen("dashboard"); }} />}
       {screen === "dashboard" && <Dashboard investments={investments} />}
       {screen === "creator_landing" && <CreatorLandingScreen onStartProposal={() => { setView("creator"); setScreen("creator"); }} onSwitchToInvestor={() => { setView("investor"); setScreen("welcome"); }} />}
-      {screen === "creator" && <CreatorView />}
+      {screen === "creator" && <CreatorView onSubmit={handleCreatorSubmit} />}
+      {screen === "compliance" && <ComplianceDashboard submittedProposal={submittedProposal} />}
     </div>
   );
 }

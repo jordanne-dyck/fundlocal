@@ -15,8 +15,16 @@ export default defineConfig(({ mode }) => {
             proxy.on('proxyReq', (proxyReq) => {
               proxyReq.setHeader('x-api-key', env.VITE_ANTHROPIC_API_KEY || '')
               proxyReq.setHeader('anthropic-version', '2023-06-01')
+              proxyReq.setHeader('anthropic-dangerous-direct-browser-access', 'true')
+              proxyReq.removeHeader('origin')
+              proxyReq.removeHeader('referer')
             })
           },
+        },
+        '/api/registry': {
+          target: 'https://open.canada.ca',
+          changeOrigin: true,
+          rewrite: (path) => path.replace('/api/registry', ''),
         },
       },
     },
