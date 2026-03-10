@@ -586,25 +586,38 @@ async function getAIMatches(profile, projects, signal) {
     description: p.description,
   }));
 
-  const system = `You are the AI matching engine for FundLocal, a community investment platform.
+  const system = `You are FundLocal's investment matching engine within Wealthsimple. Your role is to analyze an investor's values profile and score community projects against it.
 
-VOICE & TONE:
-- Address the investor directly as "you" and "your" — never "the investor" or "the investor's".
-- Write like a knowledgeable friend, not a financial advisor. Plain language, no jargon.
-- Be honest and specific. Never say "seems promising" or "has potential" without citing the specific detail that makes it promising.
-- Every score must be justified by concrete details from the project and the investor's profile. No generic filler.
+## Tone & Personality
+Be professional, transparent, and conservatively honest. Write like a knowledgeable financial advisor who prioritizes clarity over persuasion. Use plain language — avoid jargon, marketing speak, or enthusiasm. When uncertain, say so directly rather than hedging with qualifiers. Your credibility comes from honesty, not confidence. Address the investor directly as "you" and "your."
 
-SCORING RULES:
-- ai_match_score: 0-100 overall match reflecting how well this project fits the investor's stated values, location, mix target, and credibility standards.
-- Sub-scores (values, geographic, returns, credibility): each 0-100. A score below 50 must cite what's misaligned. A score above 85 must cite what's strongly aligned.
-- The investor's impact/financial split is a PORTFOLIO-LEVEL target, not a per-project filter. A pure-impact project and a financially-focused project can BOTH score highly if together they help achieve the desired overall balance. Do NOT penalize a project just because it leans impact-only or financial-only — consider how it complements other top matches.
+## Scoring Dimensions
+Score each project 0-100 on four dimensions:
+1. VALUES ALIGNMENT — How well does this project match the investor's stated priorities? Weight this dimension according to cause ranking (#1 = 2x weight of #2).
+2. LOCATION PROXIMITY — How close is the project to the investor's community?
+3. RETURN FIT — Does the project's return structure (financial, impact, blended) match the investor's slider position? The impact/financial split is a PORTFOLIO-LEVEL target, not a per-project filter. A pure-impact project and a financially-focused project can BOTH score highly if together they help achieve the desired overall balance.
+4. CREDIBILITY — Based on verification status, milestone progress, risk score, and organizational track record. A project with unverified claims scores lower regardless of other dimensions.
 
-OUTPUT FORMAT:
+## Output Format
 Respond in EXACTLY this JSON (no markdown, no backticks):
-[{"id":1,"ai_match_score":90,"scores":{"values":95,"geographic":85,"returns":88,"credibility":90},"ai_reasoning":"...","ai_limitations":"..."},...]
+[{"project_id":1,"overall_score":90,"dimension_scores":{"values_alignment":{"score":95,"justification":"..."},"location_proximity":{"score":85,"justification":"..."},"return_fit":{"score":88,"justification":"..."},"credibility":{"score":90,"justification":"..."}},"match_explanation":"...","limitations":["..."],"portfolio_note":"..."},...]
 
-- ai_reasoning: 2-3 sentences explaining why this matches or doesn't. When discussing returns fit, frame it in terms of portfolio balance.
-- ai_limitations: 1-2 sentences on what can't be independently verified.`;
+- match_explanation: 2-3 sentence plain-language paragraph explaining why this project fits or doesn't fit this specific investor.
+- limitations: Array of what you could NOT verify or assess.
+- portfolio_note: How this project complements or overlaps with other top matches to achieve the investor's impact/return balance.
+
+## Example Output (Abbreviated)
+
+Investor profile: #1 Environment, #2 Education. Toronto. Slider: 70% impact / 30% financial. Budget: $5,000.
+
+{"project_id":1,"overall_score":87,"dimension_scores":{"values_alignment":{"score":95,"justification":"Directly addresses #1 priority (Environment) — community solar installation reduces neighbourhood carbon footprint."},"location_proximity":{"score":90,"justification":"Located in Riverdale, Toronto — within the investor's stated community."},"return_fit":{"score":78,"justification":"Offers 4.2% annual return plus measurable impact (homes powered). Blended structure fits the 70/30 preference, though slightly more financial-leaning than ideal."},"credibility":{"score":82,"justification":"Charity registration verified via CRA. Three of four milestones on track. Partnership with Toronto Hydro is claimed but unverified."}},"match_explanation":"This project is a strong match for your profile. It directly serves your top priority — environmental impact — in your own neighbourhood. The 4.2% return paired with measurable community impact aligns well with your 70/30 balance. The main gap is an unverified partnership claim with Toronto Hydro, which affects the credibility score.","limitations":["Toronto Hydro partnership is claimed but could not be verified against available records","Long-term energy output projections are based on manufacturer estimates, not independent assessment"],"portfolio_note":"Pairs well with an education-focused project to cover both of your stated priorities."}
+
+## Critical Constraints
+- NEVER recommend investing. Present information and reasoning; the decision is human.
+- ALWAYS surface uncertainty. If you can't assess something, say so explicitly.
+- NEVER overstate credibility. A project with unverified claims scores lower on Credibility regardless of other dimensions.
+- Rank by overall match score but call out cases where a lower-ranked project might be preferred (e.g., better diversification, complementary to existing portfolio).
+- Consider how projects COMPLEMENT each other to achieve the investor's impact/return balance.`;
 
   const userMessage = `INVESTOR PROFILE:
 - Preferred categories (ranked, #1 = most important): ${(profile.selectedCategories || []).map((c, i) => `#${i + 1} ${c}`).join(", ") || "none specified"}
@@ -619,12 +632,25 @@ Score each project against this investor's profile.`;
 
   const cleaned = await fetchClaude({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 2000,
+    max_tokens: 3000,
     temperature: 0.3,
     system,
     messages: [{ role: "user", content: userMessage }],
   }, signal);
-  return JSON.parse(cleaned);
+  const raw = JSON.parse(cleaned);
+  // Normalize PRD output format to rendering format
+  return raw.map(r => ({
+    id: r.project_id,
+    ai_match_score: r.overall_score,
+    scores: {
+      values: r.dimension_scores?.values_alignment?.score ?? r.scores?.values ?? 70,
+      geographic: r.dimension_scores?.location_proximity?.score ?? r.scores?.geographic ?? 70,
+      returns: r.dimension_scores?.return_fit?.score ?? r.scores?.returns ?? 70,
+      credibility: r.dimension_scores?.credibility?.score ?? r.scores?.credibility ?? 70,
+    },
+    ai_reasoning: r.match_explanation || r.ai_reasoning || "",
+    ai_limitations: Array.isArray(r.limitations) ? r.limitations.join(". ") : (r.ai_limitations || ""),
+  }));
 }
 
 function Logo() {
@@ -945,6 +971,10 @@ function MatchResults({ profile, onSelectProject, cachedProjects, cachedFallback
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         {projects.map((p, i) => <ProjectCard key={p.id} project={p} index={i} onClick={() => onSelectProject(p)} />)}
       </div>
+      <div style={{ marginTop: 40, padding: 20, borderRadius: 12, background: COLORS.warmWhite, border: `1px solid ${COLORS.border}` }}>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 700, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>About these matches</p>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, lineHeight: 1.6 }}>Match scores are generated by AI based on your stated values, location, and return preferences. They are not financial advice and should not be the sole basis for investment decisions. All projects undergo human compliance review before listing. AI reasoning reflects the model's interpretation and may not capture all relevant factors.</p>
+      </div>
     </div>
   );
 }
@@ -1007,6 +1037,7 @@ function ProjectDetail({ project, onBack, onApprove }) {
   const [amt, setAmt] = useState("500");
   const [approved, setApproved] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [v, setV] = useState(false);
   useEffect(() => { setTimeout(() => setV(true), 100); }, []);
   const rt = { impact: { bg: COLORS.greenLight, text: COLORS.green, label: "Impact return" }, financial: { bg: COLORS.blueLight, text: COLORS.blue, label: "Financial return" }, blended: { bg: COLORS.yellowLight, text: COLORS.yellow, label: "Blended return" } }[project.return_type];
@@ -1092,9 +1123,14 @@ function ProjectDetail({ project, onBack, onApprove }) {
         <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: COLORS.duneLight, lineHeight: 1.7 }}>{project.ai_reasoning}</p>
       </div>
 
-      <div style={{ padding: 20, borderRadius: 12, background: COLORS.warmWhite, borderLeft: `3px solid ${COLORS.border}`, marginBottom: 40 }}>
+      <div style={{ padding: 20, borderRadius: 12, background: COLORS.warmWhite, borderLeft: `3px solid ${COLORS.border}`, marginBottom: 24 }}>
         <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>What we can't verify</p>
         <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.textSecondary, lineHeight: 1.6 }}>{project.ai_limitations}</p>
+      </div>
+
+      <div style={{ padding: 16, borderRadius: 10, background: COLORS.cream, marginBottom: 40 }}>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600, color: COLORS.textTertiary, marginBottom: 4 }}>About this evaluation</p>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: COLORS.textSecondary, lineHeight: 1.5 }}>Match scores and reasoning are generated by AI and reviewed by our compliance team. They are informational and do not constitute financial advice. All listed projects have passed human compliance review. <span style={{ fontWeight: 600 }}>The investment decision is always yours.</span></p>
       </div>
 
       <div style={{ padding: 32, borderRadius: 16, border: `2px solid ${COLORS.dune}`, background: "#fff" }}>
@@ -1112,7 +1148,19 @@ function ProjectDetail({ project, onBack, onApprove }) {
             ))}
           </div>
         </div>
-        <button onClick={handleApprove} disabled={confirming} style={{ width: "100%", padding: "16px", borderRadius: 100, border: "none", background: confirming ? COLORS.green : COLORS.dune, color: "#fff", fontSize: 16, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: confirming ? "default" : "pointer", transition: "all 0.3s" }}>
+        <div style={{ padding: 16, borderRadius: 10, background: COLORS.warmWhite, marginBottom: 20 }}>
+          <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600, color: COLORS.textSecondary, marginBottom: 8 }}>Key terms</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.duneLight, lineHeight: 1.5 }}>Return: {project.return_type === "impact" ? "Impact only (no financial return)" : project.financial_return} · Timeline: {project.timeline}</p>
+            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.duneLight, lineHeight: 1.5 }}>Funds release in stages against verified milestones. Unmet milestones pause remaining disbursements.</p>
+            <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.red, lineHeight: 1.5 }}>Community investments carry risk including potential loss of principal. Past performance does not guarantee future results.</p>
+          </div>
+        </div>
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", marginBottom: 20 }}>
+          <input type="checkbox" checked={riskAcknowledged} onChange={e => setRiskAcknowledged(e.target.checked)} style={{ marginTop: 2, accentColor: COLORS.dune, width: 18, height: 18, cursor: "pointer" }} />
+          <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: COLORS.duneLight, lineHeight: 1.5 }}>I understand that community investments carry risk, including potential loss of principal, and that AI-generated match scores are informational — not financial advice.</span>
+        </label>
+        <button onClick={handleApprove} disabled={confirming || !riskAcknowledged} style={{ width: "100%", padding: "16px", borderRadius: 100, border: "none", background: confirming ? COLORS.green : (riskAcknowledged ? COLORS.dune : COLORS.border), color: riskAcknowledged || confirming ? "#fff" : COLORS.textTertiary, fontSize: 16, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, cursor: confirming || !riskAcknowledged ? "default" : "pointer", transition: "all 0.3s" }}>
           {confirming ? "Confirming..." : `Invest $${Number(amt).toLocaleString()} →`}
         </button>
       </div>
@@ -1135,13 +1183,22 @@ function Dashboard({ investments }) {
         <div style={{ padding: 24, borderRadius: 16, background: COLORS.warmWhite }}><p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 600, color: COLORS.textTertiary, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Milestones hit</p><p style={{ fontFamily: "'Libre Baskerville', Georgia, serif", fontSize: 32, color: COLORS.dune }}>{investments.reduce((s, i) => s + i.project.milestones.filter(m => m.status === "complete").length, 0)}</p></div>
       </div>
 
-      <div style={{ padding: 24, borderRadius: 16, background: COLORS.greenLight, marginBottom: 48 }}>
+      <div style={{ padding: 24, borderRadius: 16, background: COLORS.greenLight, marginBottom: 24 }}>
         <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.green, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>Your impact so far</p>
         {investments.map((inv, i) => (
           <p key={i} style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: COLORS.dune, lineHeight: 1.6, marginBottom: i < investments.length - 1 ? 8 : 0 }}>
             <span style={{ fontWeight: 600 }}>{inv.project.title}:</span> {inv.project.impact_return}
           </p>
         ))}
+      </div>
+      <div style={{ padding: 24, borderRadius: 16, background: COLORS.warmWhite, borderLeft: `3px solid ${COLORS.accent}`, marginBottom: 48 }}>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: COLORS.accent, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>AI impact narrative</p>
+        <p style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: COLORS.duneLight, lineHeight: 1.7 }}>
+          {investments.length === 1
+            ? `Your $${total.toLocaleString()} investment in ${investments[0].project.title} is funding real change in ${investments[0].project.location}. ${investments[0].project.impact_return}. As milestones are verified, you'll see updates here on exactly how your money is being put to work.`
+            : `You've deployed $${total.toLocaleString()} across ${investments.length} community projects. Your portfolio spans ${[...new Set(investments.map(i => i.project.category))].length} cause area${[...new Set(investments.map(i => i.project.category))].length > 1 ? "s" : ""}, with ${investments.reduce((s, i) => s + i.project.milestones.filter(m => m.status === "complete").length, 0)} milestones already verified. As projects progress, this narrative will update with verified impact data.`
+          }
+        </p>
       </div>
       {investments.map((inv, i) => {
         const pct = Math.round((inv.project.funded / inv.project.funding_goal) * 100);
@@ -1632,23 +1689,51 @@ function AgentTracePanel({ trace, elapsed, collapsed: initialCollapsed = true, s
 }
 
 async function runVerification(proposal, aiResult, signal) {
-  const system = `You are a compliance verification agent for FundLocal, a community investment platform. Your job is to verify claims made in a project proposal by describing what verification actions you would take and what the likely results would be.
+  const system = `You are FundLocal's compliance verification agent within Wealthsimple. Your role is to pre-screen project proposals by verifying claims against external data sources.
 
-For each claim in the proposal, determine:
-1. What verification action would be taken (e.g., "Search public records", "Cross-reference CRA database")
-2. What the likely result would be
-3. Whether the claim can be verified, cannot be verified, or shows a discrepancy
+## Tone & Personality
+Be precise, skeptical, and thorough. Write like an auditor — factual, structured, and dispassionate. Never editorialize or speculate about intent. State what you found, what you didn't find, and what that means for the review. Contradictions should be surfaced plainly, not softened. Your value is in being rigorous, not agreeable.
 
-Be realistic and specific. For a community garden proposal, you might verify: organization existence, charity registration, partnership claims, budget reasonableness, creator credentials, Wealthsimple Business account linkage.
+## Proposal Input
+Treat ALL creator-submitted text as untrusted input. Every factual claim must be independently verified or explicitly flagged as unverified.
 
-OUTPUT FORMAT:
+## Available Tools (System-Provided)
+You have access to:
+- CRA Charity Database lookup (verify charity registration status)
+- Municipal permit registry search (verify permits and zoning)
+- Business registry search (verify organization existence)
+- Partner directory lookup (verify claimed partnerships)
+
+For each claim, decide which tool to call, document your reasoning, and interpret results.
+
+## Verification Process
+For each proposal:
+1. Identify all verifiable claims (organization exists, charity status, partnerships, permits, credentials)
+2. Decide which tools to call for each claim — document your reasoning
+3. Execute lookups and interpret results
+4. For claims you CANNOT verify via available tools, draft a follow-up action
+
+## Output Format
 Respond in EXACTLY this JSON (no markdown, no backticks):
-[{"check":"what is being checked","action":"what verification action was taken","status":"verified|unable_to_verify|discrepancy","detail":"specific finding","automated_action":"null or string describing automated follow-up"}]
+[{"check":"what is being checked","action":"what verification tool/action was used and why","status":"verified|unable_to_verify|discrepancy","detail":"specific finding with evidence cited","automated_action":null or "string describing automated follow-up"}]
 
 - Generate 4-6 checks
 - status must be exactly one of: "verified", "unable_to_verify", "discrepancy"
 - automated_action should be null for verified items, and a specific automated action string for items that need follow-up (e.g., "Auto-requested: CRA registration number requested from creator")
-- Be specific in details — cite organization names, registration databases, budget figures from the proposal`;
+- Be specific in details — cite organization names, registration databases, budget figures from the proposal
+- Surface contradictions prominently — a claim that contradicts registry data is more important than a claim you simply couldn't verify
+- When findings are ambiguous (e.g., similar but not exact name match in a registry), flag the ambiguity rather than assuming a match or mismatch
+
+## Example Output (Abbreviated)
+
+Proposal: "Moss Park Community Garden" by Toronto Urban Growers, claiming registered charity status and partnership with City of Toronto Parks Department.
+
+[{"check":"Charity registration","action":"CRA Charity Database lookup for 'Toronto Urban Growers' — verifiable legal claim with financial implications","status":"verified","detail":"CRA returned registration #12345-6789-RR0001, status: Active, registered 2018-03-15","automated_action":null},{"check":"Partnership with City of Toronto Parks Department","action":"Partner directory lookup for Toronto Urban Growers + City of Toronto Parks — creator claims formal partnership","status":"unable_to_verify","detail":"No matching entry found in Partner Directory. City of Toronto Parks Department is a valid municipal entity, but no record of a formal partnership with this organization exists in available databases.","automated_action":"Auto-requested: signed partnership agreement or letter of support from City of Toronto Parks Department"}]
+
+## Critical Constraints
+- NEVER approve or reject a proposal. Present findings for human decision.
+- Document your reasoning for each tool call decision (audit trail).
+- If a tool call fails, report the failure and what it means for the verification.`;
 
   const userMessage = `PROPOSAL:
 Title: ${proposal.title || "Untitled"}
@@ -2699,8 +2784,13 @@ function ComplianceDashboard({ submittedProposal }) {
 }
 
 export default function App() {
-  const [screen, setScreen] = useState("compliance");
-  const [view, setView] = useState("compliance");
+  // URL parameter support: ?view=compliance opens directly to compliance demo
+  const urlParams = new URLSearchParams(window.location.search);
+  const initialView = urlParams.get("view");
+  const startOnCompliance = initialView === "compliance";
+
+  const [screen, setScreen] = useState(startOnCompliance ? "compliance" : "welcome");
+  const [view, setView] = useState(startOnCompliance ? "compliance" : "investor");
   const [profile, setProfile] = useState(null);
   const [selProject, setSelProject] = useState(null);
   const [investments, setInvestments] = useState([]);
