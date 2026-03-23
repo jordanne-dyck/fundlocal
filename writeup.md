@@ -16,7 +16,7 @@ For evidence verification, Claude Vision analyzes uploaded photos — authentici
 
 ## The critical decision that must remain human
 
-Approving verification. All AI output is structured with confidence levels and presented for human review — the AI surfaces findings, it never acts on them. The decision to approve or reject a verification is human. That approval determines whether a project can list, whether funds release, whether evidence is accepted. This isn't a technical limitation. It's a regulatory and ethical requirement — in financial services, a human must own the compliance decision regardless of how capable the AI becomes.
+Approving verification. All AI output is structured with confidence levels and presented for human review — the AI surfaces findings, it never acts on them. The decision to approve or reject a verification is human. That approval determines whether a project can list, whether funds release, whether evidence is accepted. This isn't a technical limitation, it's a regulatory and ethical requirement. In financial services a human must own the compliance decision regardless of how capable the AI becomes.
 
 ## What breaks first at scale
 
